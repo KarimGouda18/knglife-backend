@@ -6,6 +6,10 @@ import { env } from "../../config/env.js";
 
 export const apiAuthRouter = Router();
 
+/**
+ * POST /api/auth/verify-id-token
+ * Body: { idToken: string }
+ */
 apiAuthRouter.post("/verify-id-token", async (req, res, next) => {
   try {
     const Body = z.object({ idToken: z.string().min(1) });
@@ -14,6 +18,7 @@ apiAuthRouter.post("/verify-id-token", async (req, res, next) => {
     const decoded = await getAuth().verifyIdToken(idToken);
 
     return res.status(200).json({
+      ok: true,
       uid: decoded.uid,
       email: decoded.email ?? null,
       claims: decoded
@@ -23,6 +28,10 @@ apiAuthRouter.post("/verify-id-token", async (req, res, next) => {
   }
 });
 
+/**
+ * POST /api/auth/custom-token
+ * Preparata ma DISABILITATA di default (sicurezza).
+ */
 apiAuthRouter.post("/custom-token", async (req, res, next) => {
   try {
     if (!env.ALLOW_CUSTOM_TOKENS) {
@@ -35,10 +44,9 @@ apiAuthRouter.post("/custom-token", async (req, res, next) => {
     });
 
     const { uid, claims } = Body.parse(req.body);
-
     const customToken = await getAuth().createCustomToken(uid, (claims ?? undefined) as any);
 
-    return res.status(200).json({ customToken });
+    return res.status(200).json({ ok: true, customToken });
   } catch (err) {
     return next(err);
   }

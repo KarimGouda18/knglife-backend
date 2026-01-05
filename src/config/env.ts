@@ -20,7 +20,7 @@ const EnvSchema = z.object({
   GEMINI_REALTIME_MODEL: z.string().min(1).default("gemini-2.5-flash-native-audio-preview-12-2025"),
   VEO_VIDEO_MODEL: z.string().min(1).default("veo-3.1"),
 
-  // Sicurezza: se true abilita endpoint per custom token anche sotto /api (di default NO)
+  // Sicurezza: in produzione tienilo false. In dev puoi metterlo true se serve.
   ALLOW_CUSTOM_TOKENS: z
     .enum(["true", "false"])
     .default("false")
