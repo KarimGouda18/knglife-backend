@@ -9,10 +9,6 @@ export const apiMeRouter = Router();
 
 apiMeRouter.use(requireAuth);
 
-/**
- * GET /api/me
- * Ritorna profilo utente (crea base se non esiste).
- */
 apiMeRouter.get("/", async (req, res, next) => {
   try {
     const uid = req.user!.uid;
@@ -27,10 +23,6 @@ apiMeRouter.get("/", async (req, res, next) => {
   }
 });
 
-/**
- * PUT /api/me
- * Body: patch del profilo (campi consentiti).
- */
 apiMeRouter.put("/", async (req, res, next) => {
   try {
     const uid = req.user!.uid;
@@ -39,7 +31,14 @@ apiMeRouter.put("/", async (req, res, next) => {
     const Body = z.object({
       name: z.string().max(80).optional(),
       surname: z.string().max(80).optional(),
-      age: z.number().int().min(0).max(120).nullable().optional(),
+
+      // ISO date: "YYYY-MM-DD"
+      birthDate: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/)
+        .nullable()
+        .optional(),
+
       gender: z.string().max(40).nullable().optional(),
       visualDisabilityLevel: z.enum(["none", "low_vision", "blind", "other"]).optional(),
       photoURL: z.string().url().nullable().optional(),

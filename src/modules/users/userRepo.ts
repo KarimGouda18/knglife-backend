@@ -1,5 +1,6 @@
 // src/modules/users/userRepo.ts
 import type { Firestore } from "firebase-admin/firestore";
+import { computeAgeFromBirthDate } from "../../shared/utils/safety.js";
 
 export type VisualDisabilityLevel = "none" | "low_vision" | "blind" | "other";
 
@@ -9,7 +10,11 @@ export type UserProfile = {
 
   name: string;
   surname: string;
+
+  // Ora il backend calcola age da birthDate
+  birthDate: string | null; // ISO date, es: "2004-01-06"
   age: number | null;
+
   gender: string | null;
   visualDisabilityLevel: VisualDisabilityLevel;
 
@@ -35,7 +40,16 @@ export async function getOrCreateUserProfile(db: Firestore, uid: string, email: 
   const snap = await ref.get();
 
   if (snap.exists) {
-    return snap.data() as UserProfile;
+    const p = snap.data() as UserProfile;
+
+    // Se birthDate presente, garantiamo age coerente (senza rompere nulla)
+    const computedAge = computeAgeFromBirthDate(p.birthDate);
+    if (computedAge !== p.age) {
+      await ref.set({ age: computedAge, updatedAt: nowIso() }, { merge: true });
+      return { ...p, age: computedAge, updatedAt: nowIso() };
+    }
+
+    return p;
   }
 
   const created: UserProfile = {
@@ -44,7 +58,10 @@ export async function getOrCreateUserProfile(db: Firestore, uid: string, email: 
 
     name: "",
     surname: "",
+
+    birthDate: null,
     age: null,
+
     gender: null,
     visualDisabilityLevel: "other",
 
@@ -61,13 +78,22 @@ export async function getOrCreateUserProfile(db: Firestore, uid: string, email: 
   return created;
 }
 
-export async function updateUserProfile(db: Firestore, uid: string, patch: Partial<UserProfile>) {
+export async function updateUserProfile(
+  db: Firestore,
+  uid: string,
+  patch: Partial<UserProfile>
+): Promise<UserProfile> {
   const ref = usersCollection(db).doc(uid);
 
-  const updatedAt = nowIso();
-  const toWrite = { ...patch, updatedAt };
+  const next: Partial<UserProfile> = { ...patch };
 
-  await ref.set(toWrite, { merge: true });
+  // Se cambia birthDate, ricalcoliamo age
+  if ("birthDate" in patch) {
+    next.age = computeAgeFromBirthDate(patch.birthDate ?? null);
+  }
+
+  next.updatedAt = nowIso();
+  await ref.set(next, { merge: true });
 
   const snap = await ref.get();
   return snap.data() as UserProfile;
