@@ -11,7 +11,7 @@ export type UserProfile = {
   name: string;
   surname: string;
 
-  birthDate: string | null; // ISO date: "YYYY-MM-DD"
+  birthDate: string | null; // "YYYY-MM-DD"
   age: number | null;
 
   gender: string | null;
@@ -22,12 +22,25 @@ export type UserProfile = {
 
   nsfwEnabled: boolean;
 
+  onboardingCompleted: boolean;
+
   createdAt: string;
   updatedAt: string;
 };
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+export function isProfileCompleted(p: UserProfile): boolean {
+  return Boolean(
+    p.name?.trim() &&
+      p.surname?.trim() &&
+      p.birthDate &&
+      (p.gender ?? "").trim() &&
+      (p.visualDisabilityLevel ?? "").trim() &&
+      p.bio?.trim()
+  );
 }
 
 function isAdultFromBirthDate(birthDate: string | null): boolean {
@@ -47,7 +60,6 @@ export async function getOrCreateUserProfile(db: Firestore, uid: string, email: 
     const p = snap.data() as UserProfile;
 
     const computedAge = computeAgeFromBirthDate(p.birthDate);
-
     const shouldDisableNsfw = p.nsfwEnabled && !isAdultFromBirthDate(p.birthDate);
     const shouldUpdateAge = computedAge !== p.age;
 
@@ -82,6 +94,7 @@ export async function getOrCreateUserProfile(db: Firestore, uid: string, email: 
     bio: "",
 
     nsfwEnabled: false,
+    onboardingCompleted: false,
 
     createdAt: nowIso(),
     updatedAt: nowIso()

@@ -15,5 +15,4 @@ apiRouter.use("/me", apiMeRouter);
 
 apiRouter.use("/assistants", apiAssistantsRouter);
 apiRouter.use("/community", apiCommunityRouter);
-
 apiRouter.use("/conversations", apiConversationsRouter);

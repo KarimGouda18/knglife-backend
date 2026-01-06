@@ -52,7 +52,7 @@ export async function generateAssistantBio(opts: {
     `- Relazione con l'utente: ${opts.assistant.relationship}`,
     ``,
     `- NSFW assistente: ${opts.assistant.nsfwEnabled ? "ON" : "OFF"}`,
-    ``,
+    `Regola: non fare mai riferimento all'utente nella bio; i dati che ti ho creato servono unicamente per adatare il tono in cui la scrivi. Devi parlare come se il personaggio si rivolgesse a un pubblico generico, quasi come se scrivesse un articolo.`,
     `Regola: Evita di ripetere stesse frasi o concetti più volte; rendi la bio scorrevole e interessante.`,
     nsfwInstruction,
     ``,
