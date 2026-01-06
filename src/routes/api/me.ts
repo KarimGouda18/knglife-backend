@@ -2,10 +2,12 @@
 import { Router } from "express";
 import { z } from "zod";
 import { requireAuth } from "../../shared/middleware/requireAuth.js";
-import { getFirestore } from "../../config/firebase.js";
+import { getFirestore, getStorage } from "../../config/firebase.js";
 import { getOrCreateUserProfile, isProfileCompleted, updateUserProfile } from "../../modules/users/userRepo.js";
 import { computeAgeFromBirthDate } from "../../shared/utils/safety.js";
 import { apiMeInterviewRouter } from "./meInterview.js";
+import { sanitizeDeep } from "../../shared/utils/sanitizeDeep.js";
+import { deleteAccountEverywhere } from "../../modules/users/deleteAccount.js";
 
 export const apiMeRouter = Router();
 apiMeRouter.use(requireAuth);
@@ -23,12 +25,14 @@ apiMeRouter.get("/", async (req, res, next) => {
     const db = getFirestore();
     const profile = await getOrCreateUserProfile(db, uid, email);
 
-    return res.status(200).json({
-      ok: true,
-      profile,
-      profileCompleted: isProfileCompleted(profile),
-      onboardingCompleted: profile.onboardingCompleted
-    });
+    return res.status(200).json(
+      sanitizeDeep({
+        ok: true,
+        profile,
+        profileCompleted: isProfileCompleted(profile),
+        onboardingCompleted: profile.onboardingCompleted
+      })
+    );
   } catch (err) {
     return next(err);
   }
@@ -51,7 +55,6 @@ apiMeRouter.put("/", async (req, res, next) => {
       bio: z.string().max(8000).optional(),
       nsfwEnabled: z.boolean().optional(),
 
-      // opzionale: se vuoi marcare onboarding completato manualmente (di default lo settiamo a fine intervista)
       onboardingCompleted: z.boolean().optional()
     });
 
@@ -72,12 +75,38 @@ apiMeRouter.put("/", async (req, res, next) => {
 
     const profile = await updateUserProfile(db, uid, patch);
 
-    return res.status(200).json({
-      ok: true,
-      profile,
-      profileCompleted: isProfileCompleted(profile),
-      onboardingCompleted: profile.onboardingCompleted
-    });
+    return res.status(200).json(
+      sanitizeDeep({
+        ok: true,
+        profile,
+        profileCompleted: isProfileCompleted(profile),
+        onboardingCompleted: profile.onboardingCompleted
+      })
+    );
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * DELETE /api/me
+ * Elimina definitivamente l'account e tutti i dati associati (Firestore + best-effort Storage + best-effort Auth user).
+ */
+apiMeRouter.delete("/", async (req, res, next) => {
+  try {
+    const uid = req.user!.uid;
+    const db = getFirestore();
+
+    let bucket = null as any;
+    try {
+      bucket = getStorage().bucket();
+    } catch {
+      bucket = null;
+    }
+
+    const result = await deleteAccountEverywhere({ db, uid, storageBucket: bucket });
+
+    return res.status(200).json(sanitizeDeep({ ok: true, ...result }));
   } catch (err) {
     return next(err);
   }
