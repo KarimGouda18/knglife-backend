@@ -42,6 +42,11 @@ export type AssistantDoc = {
   isPublic: boolean;
   publishedAt: string | null;
 
+  // ✅ Metadati clone (opzionali, non rompono nulla)
+  clonedFromAssistantId?: string | null;
+  clonedFromOwnerUid?: string | null;
+  clonedAt?: string | null;
+
   createdAt: string;
   updatedAt: string;
 };
