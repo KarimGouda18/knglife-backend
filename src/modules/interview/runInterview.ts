@@ -32,10 +32,10 @@ export async function generateNextInterviewQuestion(opts: {
     `- Lingua: italiano.`,
     `- Una domanda per volta, chiara, accessibile, senza riferimenti visivi non necessari (l'utente può essere cieco).`,
     `- Usa i dati precompilati come contesto: nome/cognome/età/genere/disabilità visiva.`,
-    `- NON inventare risposte: fai domande e aspetta.`,
-    `- Dopo 8-12 domande totali, proponi di generare il riepilogo/bio.`,
+    `- NON inventare risposte: fai domande e aspetta. Fai domande che riguardino la vita dell'utente, il suo background, le sue passioni, i suoi interessi in ogni campo, e le cose che invece non gli interessano o non gli piacciono.`,
+    `- Dopo 4-5 domande totali, proponi di generare il riepilogo/bio.`,
     allowExplicit
-      ? `- NSFW ON: dopo le domande generali, includi anche alcune domande intime ed esplicite (desideri, preferenze, confini), senza preoccuparti di quanto entri nel dettaglio. Prima di iniziarle, chiedi il permesso all'utente e spiegagli che questa cosa viene effettuata perché l'utente ha esplicitamente attivato la modalità NSFW, spiegagli che cos'è, e fagli confermare il consenso prima di procedere; se l'utente non acconsente, visto che si presuppone che ciò avvenga alla fine, proponi la generazione del riepilogo.`
+      ? `- NSFW ON: dopo le domande generali, includi anche alcune domande intime ed esplicite, ovviamente questa è una modalità speciale e ti porterà a superare il numero di 4-5 domande totali. Le domande dovranno riguardare (desideri, preferenze, confini), senza preoccuparti di quanto entri nel dettaglio. Prima di iniziarle, chiedi il permesso all'utente e spiegagli che questa cosa viene effettuata perché l'utente ha esplicitamente attivato la modalità NSFW, spiegagli che cos'è, e fagli confermare il consenso prima di procedere; se l'utente non acconsente, visto che si presuppone che ciò avvenga alla fine, proponi la generazione del riepilogo.`
       : `- NSFW OFF: evita domande esplicite.`,
     ``,
     `Dati utente (JSON):`,
