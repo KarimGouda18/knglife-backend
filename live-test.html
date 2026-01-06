@@ -1,0 +1,527 @@
+<!-- live-test.html -->
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>KNGLife Live Test</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+      label { display: block; font-weight: 600; margin-top: 12px; }
+      input, textarea, button, select { font-size: 14px; }
+      input, textarea { width: 100%; max-width: 980px; padding: 10px; border-radius: 10px; border: 1px solid #ccc; }
+      textarea { height: 120px; }
+      button { padding: 10px 14px; border-radius: 10px; border: 1px solid #333; background: #fff; cursor: pointer; }
+      button[disabled] { opacity: 0.55; cursor: not-allowed; }
+      .pill { display:inline-block; padding: 4px 10px; border-radius: 999px; background:#f2f2f2; }
+      pre { background: #111; color: #eee; padding: 12px; border-radius: 12px; overflow:auto; max-width: 980px; }
+      .ok { color: #0a7; font-weight: 700; }
+      .bad { color: #c33; font-weight: 700; }
+      .muted { color: #666; }
+      .grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+      @media (min-width: 900px) { .grid { grid-template-columns: 1fr 1fr; } }
+    </style>
+  </head>
+  <body>
+    <h1>Live call test (WebSocket) 🎧</h1>
+    <p class="muted">
+      Apri questa pagina da <span class="pill">http://localhost:XXXX</span>, non da <span class="pill">file://</span>.
+    </p>
+
+    <div class="grid">
+      <div>
+        <label for="wsUrl">WebSocket URL</label>
+        <input id="wsUrl" spellcheck="false" />
+        <div class="muted" style="margin-top:6px">
+          Esempio: <code>ws://localhost:8080/api/live/assistants/&lt;assistantId&gt;?idToken=&lt;JWT&gt;</code>
+        </div>
+      </div>
+
+      <div>
+        <label for="status">Stato</label>
+        <div id="status" class="pill">idle</div>
+
+        <label for="log" style="margin-top:12px">Log</label>
+        <pre id="log"></pre>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top: 14px">
+      <button id="btnConnect">Connetti</button>
+      <button id="btnDisconnect" disabled>Disconnetti</button>
+
+      <button id="btnStartMic" disabled>Avvia microfono</button>
+      <button id="btnStopMic" disabled>Stop microfono</button>
+
+      <span class="pill" id="audioInfo">audio: not-ready</span>
+      <span class="pill" id="queueInfo">queue: 0 ms</span>
+    </div>
+
+    <label for="sendText">Testo (opzionale)</label>
+    <div class="row">
+      <input id="sendText" placeholder="Scrivi qualcosa e invia (se il tuo server gestisce input testuale)..." />
+      <button id="btnSendText" disabled>Invia testo</button>
+    </div>
+
+    <script>
+      // ===========================
+      // Utilities
+      // ===========================
+      const $ = (id) => document.getElementById(id);
+
+      function logLine(msg, kind = "info") {
+        const el = $("log");
+        const prefix = kind === "ok" ? "[ok] " : kind === "bad" ? "[err] " : "[log] ";
+        el.textContent += `${prefix}${msg}\n`;
+        el.scrollTop = el.scrollHeight;
+        // eslint-disable-next-line no-console
+        console.log(prefix + msg);
+      }
+
+      function setStatus(text, kind = "info") {
+        const s = $("status");
+        s.textContent = text;
+        s.className = "pill " + (kind === "ok" ? "ok" : kind === "bad" ? "bad" : "");
+      }
+
+      function base64ToUint8Array(b64) {
+        const bin = atob(b64);
+        const len = bin.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+        return bytes;
+      }
+
+      function int16ToFloat32(int16) {
+        const f32 = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) {
+          f32[i] = Math.max(-1, Math.min(1, int16[i] / 32768));
+        }
+        return f32;
+      }
+
+      // linear resample if needed (sourceRate -> targetRate)
+      function resampleLinear(input, sourceRate, targetRate) {
+        if (sourceRate === targetRate) return input;
+        const ratio = targetRate / sourceRate;
+        const outLen = Math.max(1, Math.round(input.length * ratio));
+        const out = new Float32Array(outLen);
+        for (let i = 0; i < outLen; i++) {
+          const srcPos = i / ratio;
+          const i0 = Math.floor(srcPos);
+          const i1 = Math.min(input.length - 1, i0 + 1);
+          const t = srcPos - i0;
+          out[i] = input[i0] * (1 - t) + input[i1] * t;
+        }
+        return out;
+      }
+
+      // ===========================
+      // Audio: Worklet queue player
+      // ===========================
+      const SERVER_AUDIO_SAMPLE_RATE = 24000; // Gemini live output in your design
+      let audioCtx = null;
+      let workletNode = null;
+      let workletReady = false;
+
+      function queueMs() {
+        if (!workletNode) return 0;
+        return workletNode._queuedMs || 0;
+      }
+
+      async function ensureAudio() {
+        if (audioCtx && workletNode && workletReady) return;
+
+        // Create AudioContext (browser may pick its own sample rate; we handle resample)
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+        // Inline AudioWorklet processor
+        const workletCode = `
+          class PcmQueueProcessor extends AudioWorkletProcessor {
+            constructor() {
+              super();
+              this._queue = [];
+              this._queueSamples = 0;
+              this._lastReport = 0;
+
+              this.port.onmessage = (ev) => {
+                const msg = ev.data || {};
+                if (msg.type === 'push' && msg.samples) {
+                  // msg.samples is a Float32Array (transferred)
+                  const arr = msg.samples;
+                  this._queue.push(arr);
+                  this._queueSamples += arr.length;
+                } else if (msg.type === 'clear') {
+                  this._queue = [];
+                  this._queueSamples = 0;
+                }
+              };
+            }
+
+            process(_inputs, outputs) {
+              const out = outputs[0];
+              const ch0 = out[0];
+
+              let offset = 0;
+              while (offset < ch0.length) {
+                if (this._queue.length === 0) {
+                  // underrun -> silence
+                  for (; offset < ch0.length; offset++) ch0[offset] = 0;
+                  break;
+                }
+
+                const head = this._queue[0];
+                const take = Math.min(head.length, ch0.length - offset);
+
+                ch0.set(head.subarray(0, take), offset);
+
+                if (take === head.length) {
+                  this._queue.shift();
+                } else {
+                  this._queue[0] = head.subarray(take);
+                }
+
+                this._queueSamples -= take;
+                offset += take;
+              }
+
+              // Send queue length to UI ~6 times/sec
+              const now = currentTime;
+              if (now - this._lastReport > 0.16) {
+                this._lastReport = now;
+                const queuedMs = (this._queueSamples / sampleRate) * 1000;
+                this.port.postMessage({ type: 'q', queuedMs });
+              }
+
+              return true;
+            }
+          }
+
+          registerProcessor('pcm-queue-processor', PcmQueueProcessor);
+        `;
+
+        const blob = new Blob([workletCode], { type: "application/javascript" });
+        const url = URL.createObjectURL(blob);
+        await audioCtx.audioWorklet.addModule(url);
+        URL.revokeObjectURL(url);
+
+        workletNode = new AudioWorkletNode(audioCtx, "pcm-queue-processor", {
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: [1]
+        });
+
+        workletNode._queuedMs = 0;
+        workletNode.port.onmessage = (ev) => {
+          const msg = ev.data || {};
+          if (msg.type === "q") {
+            workletNode._queuedMs = msg.queuedMs || 0;
+            $("queueInfo").textContent = `queue: ${Math.round(workletNode._queuedMs)} ms`;
+          }
+        };
+
+        workletNode.connect(audioCtx.destination);
+        workletReady = true;
+        $("audioInfo").textContent = `audio: ready (ctx ${audioCtx.sampleRate} Hz)`;
+        logLine(`Audio ready. AudioContext sampleRate=${audioCtx.sampleRate}`);
+      }
+
+      function clearAudioQueue() {
+        if (workletNode) workletNode.port.postMessage({ type: "clear" });
+      }
+
+      async function pushPcm16Base64ToAudioQueue(b64, mimeTypeMaybe) {
+        // Expecting audio/pcm or similar. We ignore mime except for debugging.
+        await ensureAudio();
+
+        // Decode base64 -> Int16 PCM little-endian
+        const bytes = base64ToUint8Array(b64);
+        const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+
+        // Convert to Float32
+        let f32 = int16ToFloat32(int16);
+
+        // Resample if AudioContext sampleRate differs
+        const targetRate = audioCtx.sampleRate;
+        f32 = resampleLinear(f32, SERVER_AUDIO_SAMPLE_RATE, targetRate);
+
+        // Transferable push into worklet
+        workletNode.port.postMessage({ type: "push", samples: f32 }, [f32.buffer]);
+      }
+
+      // ===========================
+      // WebSocket + Mic capture
+      // ===========================
+      let ws = null;
+
+      let micStream = null;
+      let micSourceNode = null;
+      let micProcessor = null; // ScriptProcessorNode (ok for a test tool)
+      let micRunning = false;
+
+      const MIC_SAMPLE_RATE = 16000; // Your design: PCM16 16kHz input
+      const MIC_CHUNK_MS = 20; // send 20ms frames
+      const MIC_SAMPLES_PER_CHUNK = Math.round((MIC_SAMPLE_RATE * MIC_CHUNK_MS) / 1000);
+
+      // Downsample from audioCtx.sampleRate -> 16kHz for mic
+      function downsampleTo16k(float32, inRate, outRate) {
+        if (inRate === outRate) return float32;
+        const ratio = inRate / outRate;
+        const outLen = Math.floor(float32.length / ratio);
+        const out = new Float32Array(outLen);
+        let pos = 0;
+        for (let i = 0; i < outLen; i++) {
+          const idx = Math.floor(pos);
+          const idx2 = Math.min(float32.length - 1, idx + 1);
+          const t = pos - idx;
+          out[i] = float32[idx] * (1 - t) + float32[idx2] * t;
+          pos += ratio;
+        }
+        return out;
+      }
+
+      function float32ToPcm16Bytes(float32) {
+        const out = new Int16Array(float32.length);
+        for (let i = 0; i < float32.length; i++) {
+          const s = Math.max(-1, Math.min(1, float32[i]));
+          out[i] = s < 0 ? s * 32768 : s * 32767;
+        }
+        return new Uint8Array(out.buffer);
+      }
+
+      function bytesToBase64(bytes) {
+        // chunked encode to avoid call stack explosion
+        let bin = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+          bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+        }
+        return btoa(bin);
+      }
+
+      function wsSendJson(obj) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(JSON.stringify(obj));
+      }
+
+      function setUiConnected(connected) {
+        $("btnConnect").disabled = connected;
+        $("btnDisconnect").disabled = !connected;
+        $("btnStartMic").disabled = !connected;
+        $("btnSendText").disabled = !connected;
+      }
+
+      async function connectWs() {
+        const url = $("wsUrl").value.trim();
+        if (!url) {
+          logLine("Inserisci WS URL", "bad");
+          return;
+        }
+
+        setStatus("connecting", "info");
+        logLine(`[ws] connecting: ${url}`);
+
+        ws = new WebSocket(url);
+
+        ws.onopen = async () => {
+          setStatus("open", "ok");
+          logLine("[ws] open", "ok");
+          setUiConnected(true);
+
+          // Prepare audio early so first chunks play in realtime
+          try { await ensureAudio(); } catch (e) { logLine("Audio init failed: " + (e?.message ?? e), "bad"); }
+        };
+
+        ws.onclose = (ev) => {
+          logLine(`[ws] close code=${ev.code} reason=${ev.reason || ""}`);
+          setStatus("closed", "bad");
+          setUiConnected(false);
+          stopMic();
+          ws = null;
+        };
+
+        ws.onerror = () => {
+          logLine("[ws] error", "bad");
+          setStatus("error", "bad");
+        };
+
+        ws.onmessage = async (ev) => {
+          // Expect JSON messages from your server
+          let msg = null;
+          try { msg = JSON.parse(ev.data); } catch { /* ignore */ }
+
+          if (!msg) return;
+
+          // Try to catch various shapes (be permissive)
+          // Examples we support:
+          // - { type: "output_audio", mimeType: "audio/pcm", dataBase64: "..." }
+          // - { type: "audio", audioBase64: "..." }
+          // - { event: "output_audio", audio: { dataBase64, mimeType } }
+          const type = msg.type || msg.event || msg.kind;
+
+          // Server debug logs
+          if (type === "log" && msg.message) {
+            logLine(`[server] ${msg.message}`);
+            return;
+          }
+
+          // Audio chunk
+          const audioB64 =
+            msg.dataBase64 ||
+            msg.audioBase64 ||
+            msg?.audio?.dataBase64 ||
+            msg?.audio?.audioBase64 ||
+            null;
+
+          const mimeType =
+            msg.mimeType ||
+            msg?.audio?.mimeType ||
+            msg?.audioMimeType ||
+            "audio/pcm";
+
+          if (audioB64) {
+            // queue it: this is the FIX that prevents "all together / fast"
+            try {
+              await pushPcm16Base64ToAudioQueue(audioB64, mimeType);
+            } catch (e) {
+              logLine("Audio queue push failed: " + (e?.message ?? e), "bad");
+            }
+          }
+
+          // Optional: transcription
+          if (msg.transcript || msg.text) {
+            const t = (msg.transcript || msg.text || "").toString();
+            if (t.trim()) logLine(`[model] ${t}`);
+          }
+        };
+      }
+
+      function disconnectWs() {
+        if (ws) ws.close(1000, "client_close");
+      }
+
+      async function startMic() {
+        if (micRunning) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          logLine("WS non connessa", "bad");
+          return;
+        }
+
+        await ensureAudio();
+
+        // must resume context on user gesture
+        if (audioCtx.state !== "running") await audioCtx.resume();
+
+        try {
+          micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        } catch (e) {
+          logLine("Permesso microfono negato o dispositivo non disponibile: " + (e?.message ?? e), "bad");
+          return;
+        }
+
+        micSourceNode = audioCtx.createMediaStreamSource(micStream);
+
+        // ScriptProcessor: ok per test tool (deprecated, ma compatibile)
+        // buffer size: enough to capture smoothly
+        micProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+        let carry = new Float32Array(0);
+
+        micProcessor.onaudioprocess = (e) => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+          const input = e.inputBuffer.getChannelData(0);
+          // downsample to 16k
+          const ds = downsampleTo16k(input, audioCtx.sampleRate, MIC_SAMPLE_RATE);
+
+          // concat carry + ds
+          const merged = new Float32Array(carry.length + ds.length);
+          merged.set(carry, 0);
+          merged.set(ds, carry.length);
+
+          // send in 20ms chunks
+          let offset = 0;
+          while (offset + MIC_SAMPLES_PER_CHUNK <= merged.length) {
+            const frame = merged.subarray(offset, offset + MIC_SAMPLES_PER_CHUNK);
+            const pcmBytes = float32ToPcm16Bytes(frame);
+            const b64 = bytesToBase64(pcmBytes);
+
+            // === IMPORTANT ===
+            // This message shape must match what your backend WS expects.
+            // I keep it generic and consistent:
+            wsSendJson({
+              type: "input_audio",
+              mimeType: "audio/pcm;rate=16000",
+              dataBase64: b64
+            });
+
+            offset += MIC_SAMPLES_PER_CHUNK;
+          }
+
+          carry = merged.subarray(offset);
+        };
+
+        micSourceNode.connect(micProcessor);
+        micProcessor.connect(audioCtx.destination); // can be muted but keeps node alive
+
+        micRunning = true;
+        $("btnStartMic").disabled = true;
+        $("btnStopMic").disabled = false;
+        logLine("Mic started ✅", "ok");
+      }
+
+      function stopMic() {
+        if (!micRunning) return;
+
+        try {
+          if (micProcessor) micProcessor.disconnect();
+          if (micSourceNode) micSourceNode.disconnect();
+        } catch {}
+
+        micProcessor = null;
+        micSourceNode = null;
+
+        if (micStream) {
+          micStream.getTracks().forEach((t) => t.stop());
+          micStream = null;
+        }
+
+        micRunning = false;
+        $("btnStartMic").disabled = !ws || ws.readyState !== WebSocket.OPEN;
+        $("btnStopMic").disabled = true;
+
+        logLine("Mic stopped.");
+      }
+
+      function sendText() {
+        const txt = $("sendText").value.trim();
+        if (!txt) return;
+        wsSendJson({ type: "input_text", text: txt });
+        $("sendText").value = "";
+        logLine(`[you] ${txt}`);
+      }
+
+      // ===========================
+      // UI wiring
+      // ===========================
+      // default URL helper (edit as you like)
+      $("wsUrl").value = `ws://localhost:8080/api/live/assistants/ASSISTANT_ID?idToken=PASTE_ID_TOKEN`;
+
+      $("btnConnect").onclick = () => connectWs();
+      $("btnDisconnect").onclick = () => disconnectWs();
+      $("btnStartMic").onclick = () => startMic();
+      $("btnStopMic").onclick = () => stopMic();
+      $("btnSendText").onclick = () => sendText();
+
+      setUiConnected(false);
+      $("btnStopMic").disabled = true;
+
+      // Keep queue indicator alive even before reports
+      setInterval(() => {
+        if (!workletNode) return;
+        $("queueInfo").textContent = `queue: ${Math.round(queueMs())} ms`;
+      }, 400);
+    </script>
+  </body>
+</html>
