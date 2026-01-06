@@ -11,8 +11,7 @@ export type UserProfile = {
   name: string;
   surname: string;
 
-  // Ora il backend calcola age da birthDate
-  birthDate: string | null; // ISO date, es: "2004-01-06"
+  birthDate: string | null; // ISO date: "YYYY-MM-DD"
   age: number | null;
 
   gender: string | null;
@@ -31,6 +30,11 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function isAdultFromBirthDate(birthDate: string | null): boolean {
+  const age = computeAgeFromBirthDate(birthDate);
+  return typeof age === "number" && age >= 18;
+}
+
 export function usersCollection(db: Firestore) {
   return db.collection("users");
 }
@@ -42,11 +46,20 @@ export async function getOrCreateUserProfile(db: Firestore, uid: string, email: 
   if (snap.exists) {
     const p = snap.data() as UserProfile;
 
-    // Se birthDate presente, garantiamo age coerente (senza rompere nulla)
     const computedAge = computeAgeFromBirthDate(p.birthDate);
-    if (computedAge !== p.age) {
-      await ref.set({ age: computedAge, updatedAt: nowIso() }, { merge: true });
-      return { ...p, age: computedAge, updatedAt: nowIso() };
+
+    const shouldDisableNsfw = p.nsfwEnabled && !isAdultFromBirthDate(p.birthDate);
+    const shouldUpdateAge = computedAge !== p.age;
+
+    if (shouldDisableNsfw || shouldUpdateAge) {
+      const patch: Partial<UserProfile> = {
+        age: computedAge,
+        updatedAt: nowIso()
+      };
+      if (shouldDisableNsfw) patch.nsfwEnabled = false;
+
+      await ref.set(patch, { merge: true });
+      return { ...p, ...patch } as UserProfile;
     }
 
     return p;
@@ -78,16 +91,11 @@ export async function getOrCreateUserProfile(db: Firestore, uid: string, email: 
   return created;
 }
 
-export async function updateUserProfile(
-  db: Firestore,
-  uid: string,
-  patch: Partial<UserProfile>
-): Promise<UserProfile> {
+export async function updateUserProfile(db: Firestore, uid: string, patch: Partial<UserProfile>): Promise<UserProfile> {
   const ref = usersCollection(db).doc(uid);
 
   const next: Partial<UserProfile> = { ...patch };
 
-  // Se cambia birthDate, ricalcoliamo age
   if ("birthDate" in patch) {
     next.age = computeAgeFromBirthDate(patch.birthDate ?? null);
   }

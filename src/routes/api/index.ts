@@ -4,6 +4,7 @@ import { apiAuthRouter } from "./auth.js";
 import { apiMeRouter } from "./me.js";
 import { apiAssistantsRouter } from "./assistants.js";
 import { apiCommunityRouter } from "./community.js";
+import { apiConversationsRouter } from "./conversations.js";
 
 export const apiRouter = Router();
 
@@ -14,3 +15,5 @@ apiRouter.use("/me", apiMeRouter);
 
 apiRouter.use("/assistants", apiAssistantsRouter);
 apiRouter.use("/community", apiCommunityRouter);
+
+apiRouter.use("/conversations", apiConversationsRouter);

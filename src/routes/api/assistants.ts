@@ -18,6 +18,7 @@ import {
 import { generateAssistantBio } from "../../modules/assistants/generateBio.js";
 import { generateAndUploadAssistantAvatar } from "../../modules/assistants/generateAvatar.js";
 import { computeAgeFromBirthDate } from "../../shared/utils/safety.js";
+import { sanitizeDeep } from "../../shared/utils/sanitizeDeep.js";
 
 export const apiAssistantsRouter = Router();
 apiAssistantsRouter.use(requireAuth);
@@ -25,15 +26,25 @@ apiAssistantsRouter.use(requireAuth);
 function userAllowsAssistantNsfw(user: { birthDate: string | null; nsfwEnabled: boolean }, assistantNsfw: boolean) {
   const age = computeAgeFromBirthDate(user.birthDate);
   const isAdult = typeof age === "number" && age >= 18;
-  if (!assistantNsfw) return true; // sempre ok
-  return isAdult && user.nsfwEnabled; // regola tua: profilo NSFW ON + maggiorenne
+  if (!assistantNsfw) return true;
+  return isAdult && user.nsfwEnabled;
 }
+
+const AvatarSpecSchema = z.object({
+  ethnicity: z.string().min(1).max(50),
+  heightCm: z.number().int().min(80).max(230),
+  bodyType: z.string().min(1).max(50),
+  hairStyle: z.string().min(1).max(60),
+  hairColor: z.string().min(1).max(40),
+  eyeColor: z.string().min(1).max(40),
+  clothingStyle: z.string().min(1).max(80)
+});
 
 apiAssistantsRouter.get("/", async (req, res, next) => {
   try {
     const db = getFirestore();
     const list = await listOwnerAssistants(db, req.user!.uid, 50);
-    return res.status(200).json({ ok: true, assistants: list });
+    return res.status(200).json(sanitizeDeep({ ok: true, assistants: list }));
   } catch (err) {
     return next(err);
   }
@@ -46,20 +57,12 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
       surname: z.string().min(1).max(80),
       age: z.number().int().min(0).max(120),
       gender: z.string().min(1).max(40),
-      relationship: z.string().min(1).max(80),
+      relationship: z.string().min(1).max(120),
 
       bioMode: z.enum(["manual", "auto"]).default("auto"),
-      bio: z.string().max(5000).optional(),
+      bio: z.string().max(8000).optional(),
 
-      avatarSpec: z.object({
-        ethnicity: z.string().min(1).max(50),
-        heightCm: z.number().int().min(80).max(230),
-        bodyType: z.string().min(1).max(50),
-        hairStyle: z.string().min(1).max(60),
-        hairColor: z.string().min(1).max(40),
-        eyeColor: z.string().min(1).max(40),
-        clothingStyle: z.string().min(1).max(80)
-      }),
+      avatarSpec: AvatarSpecSchema,
 
       nsfwEnabled: z.boolean().default(false)
     });
@@ -85,9 +88,18 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
           age: input.age,
           gender: input.gender,
           relationship: input.relationship,
-          nsfwEnabled: input.nsfwEnabled
+          nsfwEnabled: input.nsfwEnabled,
+          avatarSpec: input.avatarSpec
         },
-        user: { birthDate: userProfile.birthDate, nsfwEnabled: userProfile.nsfwEnabled }
+        user: {
+          name: userProfile.name,
+          surname: userProfile.surname,
+          gender: userProfile.gender,
+          visualDisabilityLevel: userProfile.visualDisabilityLevel,
+          birthDate: userProfile.birthDate,
+          age: userProfile.age,
+          nsfwEnabled: userProfile.nsfwEnabled
+        }
       });
     }
 
@@ -127,7 +139,9 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
     };
 
     await createAssistant(db, doc);
-    return res.status(201).json({ ok: true, assistant: doc });
+
+    // Sanitizzazione profonda prima della risposta (anti-jq parse error)
+    return res.status(201).json(sanitizeDeep({ ok: true, assistant: doc }));
   } catch (err) {
     return next(err);
   }
@@ -140,7 +154,7 @@ apiAssistantsRouter.get("/:id", async (req, res, next) => {
     if (!a || a.ownerUid !== req.user!.uid) {
       return res.status(404).json({ ok: false, error: "ASSISTANT_NOT_FOUND" });
     }
-    return res.status(200).json({ ok: true, assistant: a });
+    return res.status(200).json(sanitizeDeep({ ok: true, assistant: a }));
   } catch (err) {
     return next(err);
   }
@@ -153,35 +167,24 @@ apiAssistantsRouter.put("/:id", async (req, res, next) => {
       surname: z.string().min(1).max(80).optional(),
       age: z.number().int().min(0).max(120).optional(),
       gender: z.string().min(1).max(40).optional(),
-      relationship: z.string().min(1).max(80).optional(),
+      relationship: z.string().min(1).max(120).optional(),
 
-      bio: z.string().max(5000).optional(),
+      bio: z.string().max(8000).optional(),
       bioMode: z.enum(["manual", "auto"]).optional(),
 
-      avatarSpec: z
-        .object({
-          ethnicity: z.string().min(1).max(50),
-          heightCm: z.number().int().min(80).max(230),
-          bodyType: z.string().min(1).max(50),
-          hairStyle: z.string().min(1).max(60),
-          hairColor: z.string().min(1).max(40),
-          eyeColor: z.string().min(1).max(40),
-          clothingStyle: z.string().min(1).max(80)
-        })
-        .optional(),
+      avatarSpec: AvatarSpecSchema.optional(),
 
       nsfwEnabled: z.boolean().optional()
     });
 
     const patch = Body.parse(req.body);
-    const db = getFirestore();
 
+    const db = getFirestore();
     const existing = await getAssistant(db, req.params.id);
     if (!existing || existing.ownerUid !== req.user!.uid) {
       return res.status(404).json({ ok: false, error: "ASSISTANT_NOT_FOUND" });
     }
 
-    // Se attivi NSFW ora, gating
     if (patch.nsfwEnabled === true && existing.nsfwEnabled === false) {
       const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
       if (!userAllowsAssistantNsfw(userProfile, true)) {
@@ -190,7 +193,7 @@ apiAssistantsRouter.put("/:id", async (req, res, next) => {
     }
 
     const updated = await updateAssistant(db, req.params.id, patch);
-    return res.status(200).json({ ok: true, assistant: updated });
+    return res.status(200).json(sanitizeDeep({ ok: true, assistant: updated }));
   } catch (err) {
     return next(err);
   }
@@ -220,7 +223,7 @@ apiAssistantsRouter.post("/:id/publish", async (req, res, next) => {
     }
 
     const updated = await publishAssistant(db, req.params.id);
-    return res.status(200).json({ ok: true, assistant: updated });
+    return res.status(200).json(sanitizeDeep({ ok: true, assistant: updated }));
   } catch (err) {
     return next(err);
   }
@@ -235,7 +238,7 @@ apiAssistantsRouter.post("/:id/unpublish", async (req, res, next) => {
     }
 
     const updated = await unpublishAssistant(db, req.params.id);
-    return res.status(200).json({ ok: true, assistant: updated });
+    return res.status(200).json(sanitizeDeep({ ok: true, assistant: updated }));
   } catch (err) {
     return next(err);
   }
@@ -255,12 +258,28 @@ apiAssistantsRouter.post("/:id/bio/generate", async (req, res, next) => {
     }
 
     const bio = await generateAssistantBio({
-      assistant: existing,
-      user: { birthDate: userProfile.birthDate, nsfwEnabled: userProfile.nsfwEnabled }
+      assistant: {
+        name: existing.name,
+        surname: existing.surname,
+        age: existing.age,
+        gender: existing.gender,
+        relationship: existing.relationship,
+        nsfwEnabled: existing.nsfwEnabled,
+        avatarSpec: existing.avatarSpec
+      },
+      user: {
+        name: userProfile.name,
+        surname: userProfile.surname,
+        gender: userProfile.gender,
+        visualDisabilityLevel: userProfile.visualDisabilityLevel,
+        birthDate: userProfile.birthDate,
+        age: userProfile.age,
+        nsfwEnabled: userProfile.nsfwEnabled
+      }
     });
 
     const updated = await updateAssistant(db, req.params.id, { bio, bioMode: "auto" });
-    return res.status(200).json({ ok: true, assistant: updated });
+    return res.status(200).json(sanitizeDeep({ ok: true, assistant: updated }));
   } catch (err) {
     return next(err);
   }
@@ -290,7 +309,7 @@ apiAssistantsRouter.post("/:id/avatar/generate", async (req, res, next) => {
     });
 
     const updated = await updateAssistant(db, req.params.id, { avatar });
-    return res.status(200).json({ ok: true, assistant: updated });
+    return res.status(200).json(sanitizeDeep({ ok: true, assistant: updated }));
   } catch (err) {
     return next(err);
   }
