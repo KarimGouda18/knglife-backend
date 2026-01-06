@@ -33,6 +33,30 @@ function buildSystemContext(opts: {
   ].join("\n");
 }
 
+function normalizeInlineBase64(input: string) {
+  // Se arriva "data:xxx;base64,AAAA", estraiamo solo la parte base64.
+  const idx = input.indexOf("base64,");
+  if (idx >= 0) return input.slice(idx + "base64,".length).trim();
+  return input.trim();
+}
+
+function toGeminiRole(role: "user" | "assistant") {
+  // Il modello Gemini capisce "user" e "model". "assistant" spesso crea problemi con inlineData.
+  return role === "assistant" ? ("model" as const) : ("user" as const);
+}
+
+function mapPartsToGemini(parts: MessagePart[]) {
+  return parts.map((p) => {
+    if (p.type === "text") return { text: p.text };
+    return {
+      inlineData: {
+        mimeType: p.mimeType,
+        data: normalizeInlineBase64(p.dataBase64)
+      }
+    };
+  });
+}
+
 export async function runConversation(opts: {
   history: { role: "user" | "assistant"; parts: MessagePart[] }[];
   userProfile: UserProfile;
@@ -70,14 +94,11 @@ export async function runConversation(opts: {
   });
 
   const contents = [
+    // Mettiamo il contesto come primo messaggio utente (ok in Gemini)
     { role: "user" as const, parts: [{ text: systemText }] },
     ...opts.history.map((m) => ({
-      role: m.role,
-      parts: m.parts.map((p) =>
-        p.type === "text"
-          ? { text: p.text }
-          : { inlineData: { mimeType: p.mimeType, data: p.dataBase64 } }
-      )
+      role: toGeminiRole(m.role),
+      parts: mapPartsToGemini(m.parts)
     }))
   ];
 
