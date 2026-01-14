@@ -40,14 +40,12 @@ const AvatarSpecSchema = z.object({
   clothingStyle: z.string().min(1).max(80)
 });
 
-// ✅ voci consentite (lato backend, per evitare valori strani)
 const VoiceNameSchema = z
   .string()
-  .trim()
   .min(1)
   .max(40)
-  .default("Kore")
-  .transform((v) => v || "Kore");
+  .transform((s) => s.trim())
+  .default("Kore");
 
 apiAssistantsRouter.get("/", async (req, res, next) => {
   try {
@@ -75,7 +73,7 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
 
       nsfwEnabled: z.boolean().default(false),
 
-      // ✅ NEW
+      // ✅ VOCE LIVE ASSISTANT
       voiceName: VoiceNameSchema.optional()
     });
 
@@ -90,6 +88,8 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
 
     const id = newAssistantId();
     const now = new Date().toISOString();
+
+    const voiceName = (input.voiceName ?? "Kore").trim() || "Kore";
 
     let bio = input.bioMode === "manual" ? (input.bio ?? "").trim() : "";
     if (input.bioMode === "auto") {
@@ -143,8 +143,8 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
 
       nsfwEnabled: input.nsfwEnabled,
 
-      // ✅ NEW: voce salvata
-      voiceName: (input.voiceName ?? "Kore").trim() || "Kore",
+      // ✅ persist voice
+      voiceName,
 
       isPublic: false,
       publishedAt: null,
@@ -190,8 +190,8 @@ apiAssistantsRouter.put("/:id", async (req, res, next) => {
 
       nsfwEnabled: z.boolean().optional(),
 
-      // ✅ NEW
-      voiceName: VoiceNameSchema.optional()
+      // ✅ VOCE LIVE ASSISTANT (update)
+      voiceName: z.string().min(1).max(40).optional()
     });
 
     const patch = Body.parse(req.body);
@@ -209,13 +209,11 @@ apiAssistantsRouter.put("/:id", async (req, res, next) => {
       }
     }
 
-    // Normalizza voiceName se passato come stringa vuota
-    const fixedPatch: any = { ...patch };
-    if (typeof fixedPatch.voiceName === "string") {
-      fixedPatch.voiceName = fixedPatch.voiceName.trim() || "Kore";
+    if (typeof patch.voiceName === "string") {
+      patch.voiceName = patch.voiceName.trim() || "Kore";
     }
 
-    const updated = await updateAssistant(db, req.params.id, fixedPatch);
+    const updated = await updateAssistant(db, req.params.id, patch);
     return res.status(200).json(sanitizeDeep({ ok: true, assistant: updated }));
   } catch (err) {
     return next(err);

@@ -39,7 +39,7 @@ export type AssistantDoc = {
 
   nsfwEnabled: boolean;
 
-  // ✅ Voce per Gemini Live (assistente)
+  // ✅ Live voice per ASSISTANT (non interview)
   voiceName: string;
 
   isPublic: boolean;

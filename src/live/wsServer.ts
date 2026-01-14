@@ -16,8 +16,12 @@ import { addInterviewMessage, createInterview, getInterview } from "../modules/i
  * Protocollo WS (client -> server):
  * - { type: "input_audio", dataBase64: string, mimeType?: string }  // default: audio/pcm;rate=16000
  * - { type: "input_text", text: string }                           // opzionale (debug)
- * - { type: "end_turn" }                                           // forza flush (interview)
+ * - { type: "end_turn" }                                           // forza flush
  * - { type: "close" }
+ *
+ * Compatibilità extra (per non rompere client diversi):
+ * - { type: "audio", dataBase64: string, mimeType?: string }
+ * - { type: "realtime_input", audio: { dataBase64: string, mimeType?: string } }
  *
  * Server -> client:
  * - { type: "ready", session: {...}, interviewId?: string }
@@ -30,6 +34,8 @@ import { addInterviewMessage, createInterview, getInterview } from "../modules/i
 
 type ClientMsg =
   | { type: "input_audio"; dataBase64: string; mimeType?: string }
+  | { type: "audio"; dataBase64: string; mimeType?: string }
+  | { type: "realtime_input"; audio?: { dataBase64: string; mimeType?: string } }
   | { type: "input_text"; text: string }
   | { type: "end_turn" }
   | { type: "close" };
@@ -68,6 +74,13 @@ function wsSend(ws: WebSocket, obj: any) {
 function normalizePrivateWsError(err: unknown) {
   const msg = err instanceof Error ? err.message : String(err);
   return msg || "Unknown error";
+}
+
+function normalizeInlineBase64(input: string) {
+  const s = String(input ?? "");
+  const idx = s.indexOf("base64,");
+  if (idx >= 0) return s.slice(idx + "base64,".length).trim();
+  return s.trim();
 }
 
 function pickVoiceName(assistant: any): string {
@@ -134,7 +147,7 @@ class TranscriptSaver {
   private assistantTimer: NodeJS.Timeout | null = null;
 
   private readonly FLUSH_MS = 900;
-  private readonly MIN_LEN = 8; // abbassato un filo per non perdere risposte brevi
+  private readonly MIN_LEN = 8;
   private readonly MAX_BUF = 2000;
 
   constructor(db: ReturnType<typeof getFirestore>, uid: string, interviewId: string) {
@@ -238,6 +251,22 @@ export function attachLiveWebSocketServer(server: http.Server) {
       } catch {}
     }, 25_000);
 
+    // ===== Assistant auto end-turn (VAD povero) =====
+    // Se il client non manda end_turn, noi chiudiamo il turno dopo un po' di silenzio.
+    let vadTimer: NodeJS.Timeout | null = null;
+    const VAD_SILENCE_MS = 850;
+
+    const bumpVad = async (isInterview: boolean, session: any) => {
+      if (isInterview) return; // interview gestita dal client + transcriptSaver
+      if (vadTimer) clearTimeout(vadTimer);
+      vadTimer = setTimeout(() => {
+        // "fine turno": permette al modello di rispondere
+        try {
+          void session.sendClientContent({ turns: [], turnComplete: true });
+        } catch {}
+      }, VAD_SILENCE_MS);
+    };
+
     try {
       const authUser = await verifyIdTokenFromReq(req);
       if (!authUser) {
@@ -255,6 +284,8 @@ export function attachLiveWebSocketServer(server: http.Server) {
       const isInterview = pathname === "/api/live/interview";
       let systemPrompt = "";
       let assistant: any = null;
+
+      // IMPORTANT: voice vale solo per Assistant, NON Interview
       let voiceName = "Kore";
 
       let interviewId: string | null = null;
@@ -262,7 +293,6 @@ export function attachLiveWebSocketServer(server: http.Server) {
       let transcriptSaver: TranscriptSaver | null = null;
 
       if (isInterview) {
-        // ✅ se il client passa interviewId, usiamo QUELLO (se valido)
         const requestedInterviewId = url.searchParams.get("interviewId");
 
         if (requestedInterviewId) {
@@ -273,7 +303,6 @@ export function attachLiveWebSocketServer(server: http.Server) {
           }
         }
 
-        // fallback: crea nuova
         if (!interviewId) {
           const interview = await createInterview(db, authUser.uid, userProfile.nsfwEnabled);
           interviewId = interview.id;
@@ -321,7 +350,9 @@ export function attachLiveWebSocketServer(server: http.Server) {
           return;
         }
 
-        voiceName = pickVoiceName(assistant);
+        // voice: query override (solo assistant) > assistant.voiceName > Kore
+        const voiceFromQuery = url.searchParams.get("voiceName");
+        voiceName = (voiceFromQuery || pickVoiceName(assistant)).trim() || "Kore";
 
         systemPrompt = buildAssistantLiveSystemPrompt({
           user: {
@@ -361,21 +392,26 @@ export function attachLiveWebSocketServer(server: http.Server) {
           safetySettings,
           inputAudioTranscription: {},
           outputAudioTranscription: {},
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName }
-            }
-          }
+
+          // ✅ voice SOLO per Assistant
+          ...(isInterview
+            ? {}
+            : {
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName }
+                  }
+                }
+              })
         },
         callbacks: {
           onopen: async () => {
-            // ✅ mando interviewId anche top-level per compatibilità client
             wsSend(ws, {
               type: "ready",
               interviewId: interviewId ?? undefined,
               session: {
                 mode: isInterview ? "interview" : "assistant",
-                voiceName,
+                voiceName: isInterview ? undefined : voiceName,
                 model: env.GEMINI_REALTIME_MODEL,
                 interviewId: interviewId ?? undefined
               }
@@ -441,14 +477,32 @@ export function attachLiveWebSocketServer(server: http.Server) {
         if (!msg || typeof msg.type !== "string") return;
 
         try {
-          if (msg.type === "input_audio") {
+          // === AUDIO (varianti compatibili) ===
+          if (msg.type === "input_audio" || msg.type === "audio") {
             const mimeType = msg.mimeType || "audio/pcm;rate=16000";
+            const data = normalizeInlineBase64(msg.dataBase64);
+
             await session.sendRealtimeInput({
-              audio: { data: msg.dataBase64, mimeType }
+              audio: { data, mimeType }
             });
+
+            await bumpVad(isInterview, session);
             return;
           }
 
+          if (msg.type === "realtime_input" && msg.audio?.dataBase64) {
+            const mimeType = msg.audio.mimeType || "audio/pcm;rate=16000";
+            const data = normalizeInlineBase64(msg.audio.dataBase64);
+
+            await session.sendRealtimeInput({
+              audio: { data, mimeType }
+            });
+
+            await bumpVad(isInterview, session);
+            return;
+          }
+
+          // === TESTO (debug) ===
           if (msg.type === "input_text") {
             await session.sendClientContent({
               turns: [{ role: "user", parts: [{ text: msg.text }] }],
@@ -457,16 +511,20 @@ export function attachLiveWebSocketServer(server: http.Server) {
             return;
           }
 
+          // === END TURN ===
           if (msg.type === "end_turn") {
             if (isInterview && transcriptSaver) {
               try {
                 await transcriptSaver.flushAll();
               } catch {}
             }
+
+            // Forza fine turno anche per assistant
             await session.sendClientContent({ turns: [], turnComplete: true });
             return;
           }
 
+          // === CLOSE ===
           if (msg.type === "close") {
             try {
               if (isInterview && transcriptSaver) await transcriptSaver.flushAll();
@@ -486,10 +544,12 @@ export function attachLiveWebSocketServer(server: http.Server) {
 
       ws.on("close", async () => {
         clearInterval(pingInterval);
+        if (vadTimer) clearTimeout(vadTimer);
+
         try {
-          // best-effort flush
           if (isInterview && transcriptSaver) await transcriptSaver.flushAll();
         } catch {}
+
         try {
           session.close();
         } catch {}
@@ -500,6 +560,7 @@ export function attachLiveWebSocketServer(server: http.Server) {
         ws.close(1011, "Server error");
       } catch {}
       clearInterval(pingInterval);
+      if (vadTimer) clearTimeout(vadTimer);
     }
   });
 
