@@ -1,6 +1,7 @@
 // src/live/prompts.ts
 import type { AssistantDoc } from "../modules/assistants/assistantsRepo.js";
 import type { UserProfile } from "../modules/users/userRepo.js";
+import { buildInterviewSystemInstruction } from "../modules/interview/interviewPrompts.js";
 
 export function buildAssistantLiveSystemPrompt(opts: {
   user: Pick<
@@ -35,21 +36,13 @@ export function buildInterviewLiveSystemPrompt(opts: {
     UserProfile,
     "name" | "surname" | "birthDate" | "age" | "gender" | "visualDisabilityLevel" | "bio" | "nsfwEnabled"
   >;
+  interviewNsfwEnabled: boolean;
+  allowExplicit: boolean;
 }) {
-  const payload = { user: opts.user };
-
-  return [
-    `Sei KNGGuide, la guida vocale di onboarding di KNGLife.`,
-    `Obiettivo: condurre un'intervista vocale e fare domande chiare e una alla volta.`,
-    `Stile: umano, caldo, diretto, niente fronzoli.`,
-    ``,
-    `Regole:`,
-    `- Lingua: italiano.`,
-    `- Fai domande coerenti con i dati utente disponibili.`,
-    `- Se NSFW è consentito (safety BLOCK_NONE), dopo le domande generali inserisci anche domande più intime/esplicite.`,
-    `- Non generare la bio finale qui: la bio verrà generata dopo, usando la trascrizione completa.`,
-    ``,
-    `Profilo (JSON):`,
-    JSON.stringify(payload)
-  ].join("\n");
+  // ✅ Stesso identico “system” della interview testuale
+  return buildInterviewSystemInstruction({
+    user: opts.user,
+    interviewNsfwEnabled: opts.interviewNsfwEnabled,
+    allowExplicit: opts.allowExplicit
+  });
 }

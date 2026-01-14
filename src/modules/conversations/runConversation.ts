@@ -20,7 +20,7 @@ function buildSystemContext(opts: {
   const payload = { user: opts.user, assistant: opts.assistant };
 
   return [
-    `Sei l'assistente "${opts.assistant.name} ${opts.assistant.surname}".`,
+    `Sei "${opts.assistant.name} ${opts.assistant.surname}".`,
     `Questa è una chat dentro KNGLife.`,
     `Regole:`,
     `- Rispondi in italiano.`,

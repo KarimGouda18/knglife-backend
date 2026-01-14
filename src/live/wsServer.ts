@@ -10,6 +10,7 @@ import { getGeminiSafetySettings } from "../shared/utils/safety.js";
 import { getOrCreateUserProfile } from "../modules/users/userRepo.js";
 import { getAssistant } from "../modules/assistants/assistantsRepo.js";
 import { buildAssistantLiveSystemPrompt, buildInterviewLiveSystemPrompt } from "./prompts.js";
+import { addInterviewMessage, createInterview } from "../modules/interview/interviewRepo.js";
 
 /**
  * Protocollo WS (client -> server):
@@ -84,7 +85,6 @@ function extractSignals(m: any): {
   outputTranscription?: string;
   inputTranscription?: string;
 } {
-  // output transcription
   const outTr =
     m?.serverContent?.outputTranscription?.text ??
     m?.outputAudioTranscription?.text ??
@@ -97,7 +97,6 @@ function extractSignals(m: any): {
     m?.inputTranscription?.text ??
     null;
 
-  // audio: a volte è top-level { data, mimeType }, a volte in parts.inlineData
   let audioData: string | null = null;
   let audioMime: string | null = null;
 
@@ -125,22 +124,27 @@ function extractSignals(m: any): {
   return result;
 }
 
+function shouldPersistTranscriptChunk(text: string) {
+  const t = text.trim();
+  if (!t) return false;
+  // evita spam: chunk troppo corto spesso è parziale
+  if (t.length < 2) return false;
+  return true;
+}
+
 export function attachLiveWebSocketServer(server: http.Server) {
   const wss = new WebSocketServer({ server });
 
   wss.on("connection", async (ws, req) => {
-    // routing via path
     const url = new URL(req.url ?? "/", "http://localhost");
     const pathname = url.pathname;
 
-    // only handle /api/live/*
     if (!pathname.startsWith("/api/live/")) {
       ws.close(1008, "Unsupported path");
       return;
     }
 
     try {
-      // auth
       const authUser = await verifyIdTokenFromReq(req);
       if (!authUser) {
         wsSend(ws, { type: "error", error: "MISSING_ID_TOKEN (use Authorization Bearer or ?idToken=...)" });
@@ -153,13 +157,33 @@ export function attachLiveWebSocketServer(server: http.Server) {
 
       const ai = getGenAI();
 
-      // build session config
       const isInterview = pathname === "/api/live/interview";
       let systemPrompt = "";
       let assistant: any = null;
       let voiceName = "Kore";
 
+      // ✅ Per la live interview creiamo un InterviewDoc e salviamo trascrizioni lì
+      let interviewId: string | null = null;
+      let interviewNsfwEnabled = false;
+
+      // dedupe semplice per evitare duplicati identici
+      let lastSavedUserTr = "";
+      let lastSavedAssistantTr = "";
+
       if (isInterview) {
+        // snapshot NSFW dal profilo (come la text interview)
+        const interview = await createInterview(db, authUser.uid, userProfile.nsfwEnabled);
+        interviewId = interview.id;
+        interviewNsfwEnabled = interview.nsfwEnabled;
+
+        const safetyForAllowExplicit = getGeminiSafetySettings({
+          userBirthDate: userProfile.birthDate,
+          userNsfwEnabled: interviewNsfwEnabled,
+          assistantNsfwEnabled: interviewNsfwEnabled
+        });
+
+        const allowExplicit = safetyForAllowExplicit[0]?.threshold === "BLOCK_NONE";
+
         systemPrompt = buildInterviewLiveSystemPrompt({
           user: {
             name: userProfile.name,
@@ -170,10 +194,11 @@ export function attachLiveWebSocketServer(server: http.Server) {
             visualDisabilityLevel: userProfile.visualDisabilityLevel,
             bio: userProfile.bio,
             nsfwEnabled: userProfile.nsfwEnabled
-          }
+          },
+          interviewNsfwEnabled,
+          allowExplicit
         });
       } else {
-        // /api/live/assistants/:assistantId
         const m = pathname.match(/^\/api\/live\/assistants\/([^/]+)$/);
         const assistantId = m?.[1];
         if (!assistantId) {
@@ -217,54 +242,85 @@ export function attachLiveWebSocketServer(server: http.Server) {
 
       const safetySettings = getGeminiSafetySettings({
         userBirthDate: userProfile.birthDate,
-        userNsfwEnabled: userProfile.nsfwEnabled,
-        assistantNsfwEnabled: assistant?.nsfwEnabled ?? false
+        userNsfwEnabled: isInterview ? interviewNsfwEnabled : userProfile.nsfwEnabled,
+        assistantNsfwEnabled: isInterview ? interviewNsfwEnabled : (assistant?.nsfwEnabled ?? false)
       });
 
-      // Live session:
-      // - responseModalities: ["AUDIO"] (solo audio)
-      // - inputAudioTranscription + outputAudioTranscription attive
-      // - voiceName in speechConfig
-      // Nota: i nomi campo sono quelli dell'SDK JS (camelCase). :contentReference[oaicite:1]{index=1}
       const session = await ai.live.connect({
         model: env.GEMINI_REALTIME_MODEL,
         config: {
           responseModalities: ["AUDIO"],
           systemInstruction: systemPrompt,
           safetySettings,
-
-          // audio transcription: ON
           inputAudioTranscription: {},
           outputAudioTranscription: {},
-
-          // voice
           speechConfig: {
             voiceConfig: {
               prebuiltVoiceConfig: { voiceName }
             }
-          },
-
-          // grounding (quando lo useremo): abilita tool search
+          }
           // tools: [{ googleSearch: {} }],
         },
         callbacks: {
-          onopen: () => {
+          onopen: async () => {
             wsSend(ws, {
               type: "ready",
               session: {
                 mode: isInterview ? "interview" : "assistant",
                 voiceName,
-                model: env.GEMINI_REALTIME_MODEL
+                model: env.GEMINI_REALTIME_MODEL,
+                // ✅ fondamentale: il frontend usa questo per chiamare /finish
+                interviewId: interviewId ?? undefined
               }
             });
+
+            // ✅ Per la Live interview facciamo partire subito la prima domanda (come /start nella text interview)
+            if (isInterview) {
+              try {
+                await session.sendClientContent({
+                  turns: [{ role: "user", parts: [{ text: "Inizia l'intervista con la prima domanda." }] }],
+                  turnComplete: true
+                });
+              } catch {}
+            }
           },
-          onmessage: (message: any) => {
-            // inoltra raw sempre (utile debug client)
+          onmessage: async (message: any) => {
             wsSend(ws, { type: "raw", message });
 
             const sig = extractSignals(message);
-            if (sig.inputTranscription) wsSend(ws, { type: "input_transcription", text: sig.inputTranscription });
-            if (sig.outputTranscription) wsSend(ws, { type: "output_transcription", text: sig.outputTranscription });
+
+            if (sig.inputTranscription) {
+              wsSend(ws, { type: "input_transcription", text: sig.inputTranscription });
+
+              if (isInterview && interviewId && shouldPersistTranscriptChunk(sig.inputTranscription)) {
+                const t = sig.inputTranscription.trim();
+                if (t && t !== lastSavedUserTr) {
+                  lastSavedUserTr = t;
+                  try {
+                    await addInterviewMessage(db, authUser.uid, interviewId, { role: "user", text: t });
+                  } catch (e) {
+                    wsSend(ws, { type: "error", error: `INTERVIEW_SAVE_INPUT_FAILED: ${normalizePrivateWsError(e)}` });
+                  }
+                }
+              }
+            }
+
+            if (sig.outputTranscription) {
+              wsSend(ws, { type: "output_transcription", text: sig.outputTranscription });
+
+              if (isInterview && interviewId && shouldPersistTranscriptChunk(sig.outputTranscription)) {
+                const t = sig.outputTranscription.trim();
+                if (t && t !== lastSavedAssistantTr) {
+                  lastSavedAssistantTr = t;
+                  try {
+                    await addInterviewMessage(db, authUser.uid, interviewId, { role: "assistant", text: t });
+                  } catch (e) {
+                    wsSend(ws, { type: "error", error: `INTERVIEW_SAVE_OUTPUT_FAILED: ${normalizePrivateWsError(e)}` });
+                  }
+                }
+              }
+            }
+
             if (sig.outputAudio) {
               wsSend(ws, {
                 type: "output_audio",
@@ -277,7 +333,6 @@ export function attachLiveWebSocketServer(server: http.Server) {
             wsSend(ws, { type: "error", error: normalizePrivateWsError(e) });
           },
           onclose: () => {
-            // chiusura lato Gemini
             try {
               ws.close(1000, "Live session closed");
             } catch {}
@@ -285,7 +340,6 @@ export function attachLiveWebSocketServer(server: http.Server) {
         }
       });
 
-      // client -> server
       ws.on("message", async (buf) => {
         const s = typeof buf === "string" ? buf : buf.toString("utf8");
         const msg = safeJsonParse(s) as ClientMsg | null;
