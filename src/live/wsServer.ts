@@ -10,21 +10,21 @@ import { getGeminiSafetySettings } from "../shared/utils/safety.js";
 import { getOrCreateUserProfile } from "../modules/users/userRepo.js";
 import { getAssistant } from "../modules/assistants/assistantsRepo.js";
 import { buildAssistantLiveSystemPrompt, buildInterviewLiveSystemPrompt } from "./prompts.js";
-import { addInterviewMessage, createInterview } from "../modules/interview/interviewRepo.js";
+import { addInterviewMessage, createInterview, getInterview } from "../modules/interview/interviewRepo.js";
 
 /**
  * Protocollo WS (client -> server):
  * - { type: "input_audio", dataBase64: string, mimeType?: string }  // default: audio/pcm;rate=16000
  * - { type: "input_text", text: string }                           // opzionale (debug)
- * - { type: "end_turn" }                                           // opzionale
+ * - { type: "end_turn" }                                           // forza flush (interview)
  * - { type: "close" }
  *
- * Server -> client (normalizzato, più "raw"):
- * - { type: "ready", session: {...} }
+ * Server -> client:
+ * - { type: "ready", session: {...}, interviewId?: string }
  * - { type: "output_audio", dataBase64: string, mimeType: string }
  * - { type: "output_transcription", text: string }
  * - { type: "input_transcription", text: string }
- * - { type: "raw", message: any }                                  // sempre utile per debug
+ * - { type: "raw", message: any }
  * - { type: "error", error: string }
  */
 
@@ -71,15 +71,9 @@ function normalizePrivateWsError(err: unknown) {
 }
 
 function pickVoiceName(assistant: any): string {
-  // Se in futuro aggiungi assistant.voiceName nel doc, usalo qui.
-  // Per ora fallback.
   return assistant?.voiceName || "Kore";
 }
 
-/**
- * Estrae audio/transcription dai messaggi Live.
- * La struttura può evolvere: per sicurezza inoltriamo sempre anche "raw".
- */
 function extractSignals(m: any): {
   outputAudio?: { dataBase64: string; mimeType: string };
   outputTranscription?: string;
@@ -124,12 +118,105 @@ function extractSignals(m: any): {
   return result;
 }
 
-function shouldPersistTranscriptChunk(text: string) {
-  const t = text.trim();
-  if (!t) return false;
-  // evita spam: chunk troppo corto spesso è parziale
-  if (t.length < 2) return false;
-  return true;
+function normalizeSpaces(s: string) {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+class TranscriptSaver {
+  private readonly db: ReturnType<typeof getFirestore>;
+  private readonly uid: string;
+  private readonly interviewId: string;
+
+  private userBuf = "";
+  private assistantBuf = "";
+
+  private userTimer: NodeJS.Timeout | null = null;
+  private assistantTimer: NodeJS.Timeout | null = null;
+
+  private readonly FLUSH_MS = 900;
+  private readonly MIN_LEN = 8; // abbassato un filo per non perdere risposte brevi
+  private readonly MAX_BUF = 2000;
+
+  constructor(db: ReturnType<typeof getFirestore>, uid: string, interviewId: string) {
+    this.db = db;
+    this.uid = uid;
+    this.interviewId = interviewId;
+  }
+
+  private mergeIncremental(prev: string, next: string) {
+    const p = normalizeSpaces(prev);
+    const n = normalizeSpaces(next);
+
+    if (!p) return n;
+    if (!n) return p;
+
+    if (n.startsWith(p)) return n;
+    if (p.startsWith(n)) return p;
+
+    return normalizeSpaces(`${p} ${n}`);
+  }
+
+  private shouldSave(text: string) {
+    const t = normalizeSpaces(text);
+    if (!t) return false;
+    if (t.length < this.MIN_LEN) return false;
+    return true;
+  }
+
+  private scheduleFlush(role: "user" | "assistant") {
+    const old = role === "user" ? this.userTimer : this.assistantTimer;
+    if (old) clearTimeout(old);
+
+    const timer = setTimeout(() => {
+      void this.flush(role);
+    }, this.FLUSH_MS);
+
+    if (role === "user") this.userTimer = timer;
+    else this.assistantTimer = timer;
+  }
+
+  appendUserChunk(chunk: string) {
+    const c = normalizeSpaces(chunk);
+    if (!c) return;
+    this.userBuf = this.mergeIncremental(this.userBuf, c);
+    if (this.userBuf.length >= this.MAX_BUF) void this.flush("user");
+    else this.scheduleFlush("user");
+  }
+
+  appendAssistantChunk(chunk: string) {
+    const c = normalizeSpaces(chunk);
+    if (!c) return;
+    this.assistantBuf = this.mergeIncremental(this.assistantBuf, c);
+    if (this.assistantBuf.length >= this.MAX_BUF) void this.flush("assistant");
+    else this.scheduleFlush("assistant");
+  }
+
+  async flush(role: "user" | "assistant") {
+    if (role === "user") {
+      if (this.userTimer) clearTimeout(this.userTimer);
+      this.userTimer = null;
+
+      const text = normalizeSpaces(this.userBuf);
+      this.userBuf = "";
+
+      if (!this.shouldSave(text)) return;
+      await addInterviewMessage(this.db, this.uid, this.interviewId, { role: "user", text });
+      return;
+    }
+
+    if (this.assistantTimer) clearTimeout(this.assistantTimer);
+    this.assistantTimer = null;
+
+    const text = normalizeSpaces(this.assistantBuf);
+    this.assistantBuf = "";
+
+    if (!this.shouldSave(text)) return;
+    await addInterviewMessage(this.db, this.uid, this.interviewId, { role: "assistant", text });
+  }
+
+  async flushAll() {
+    await Promise.allSettled([this.flush("user"), this.flush("assistant")]);
+  }
 }
 
 export function attachLiveWebSocketServer(server: http.Server) {
@@ -144,11 +231,19 @@ export function attachLiveWebSocketServer(server: http.Server) {
       return;
     }
 
+    // keepalive ping
+    const pingInterval = setInterval(() => {
+      try {
+        if (ws.readyState === ws.OPEN) ws.ping();
+      } catch {}
+    }, 25_000);
+
     try {
       const authUser = await verifyIdTokenFromReq(req);
       if (!authUser) {
         wsSend(ws, { type: "error", error: "MISSING_ID_TOKEN (use Authorization Bearer or ?idToken=...)" });
         ws.close(1008, "Unauthorized");
+        clearInterval(pingInterval);
         return;
       }
 
@@ -162,26 +257,34 @@ export function attachLiveWebSocketServer(server: http.Server) {
       let assistant: any = null;
       let voiceName = "Kore";
 
-      // ✅ Per la live interview creiamo un InterviewDoc e salviamo trascrizioni lì
       let interviewId: string | null = null;
       let interviewNsfwEnabled = false;
-
-      // dedupe semplice per evitare duplicati identici
-      let lastSavedUserTr = "";
-      let lastSavedAssistantTr = "";
+      let transcriptSaver: TranscriptSaver | null = null;
 
       if (isInterview) {
-        // snapshot NSFW dal profilo (come la text interview)
-        const interview = await createInterview(db, authUser.uid, userProfile.nsfwEnabled);
-        interviewId = interview.id;
-        interviewNsfwEnabled = interview.nsfwEnabled;
+        // ✅ se il client passa interviewId, usiamo QUELLO (se valido)
+        const requestedInterviewId = url.searchParams.get("interviewId");
+
+        if (requestedInterviewId) {
+          const existing = await getInterview(db, authUser.uid, requestedInterviewId);
+          if (existing && existing.ownerUid === authUser.uid && existing.status === "active") {
+            interviewId = existing.id;
+            interviewNsfwEnabled = existing.nsfwEnabled;
+          }
+        }
+
+        // fallback: crea nuova
+        if (!interviewId) {
+          const interview = await createInterview(db, authUser.uid, userProfile.nsfwEnabled);
+          interviewId = interview.id;
+          interviewNsfwEnabled = interview.nsfwEnabled;
+        }
 
         const safetyForAllowExplicit = getGeminiSafetySettings({
           userBirthDate: userProfile.birthDate,
           userNsfwEnabled: interviewNsfwEnabled,
           assistantNsfwEnabled: interviewNsfwEnabled
         });
-
         const allowExplicit = safetyForAllowExplicit[0]?.threshold === "BLOCK_NONE";
 
         systemPrompt = buildInterviewLiveSystemPrompt({
@@ -198,12 +301,15 @@ export function attachLiveWebSocketServer(server: http.Server) {
           interviewNsfwEnabled,
           allowExplicit
         });
+
+        transcriptSaver = new TranscriptSaver(db, authUser.uid, interviewId);
       } else {
         const m = pathname.match(/^\/api\/live\/assistants\/([^/]+)$/);
         const assistantId = m?.[1];
         if (!assistantId) {
           wsSend(ws, { type: "error", error: "MISSING_ASSISTANT_ID" });
           ws.close(1008, "Bad request");
+          clearInterval(pingInterval);
           return;
         }
 
@@ -211,6 +317,7 @@ export function attachLiveWebSocketServer(server: http.Server) {
         if (!assistant || assistant.ownerUid !== authUser.uid) {
           wsSend(ws, { type: "error", error: "ASSISTANT_NOT_FOUND" });
           ws.close(1008, "Not found");
+          clearInterval(pingInterval);
           return;
         }
 
@@ -259,22 +366,21 @@ export function attachLiveWebSocketServer(server: http.Server) {
               prebuiltVoiceConfig: { voiceName }
             }
           }
-          // tools: [{ googleSearch: {} }],
         },
         callbacks: {
           onopen: async () => {
+            // ✅ mando interviewId anche top-level per compatibilità client
             wsSend(ws, {
               type: "ready",
+              interviewId: interviewId ?? undefined,
               session: {
                 mode: isInterview ? "interview" : "assistant",
                 voiceName,
                 model: env.GEMINI_REALTIME_MODEL,
-                // ✅ fondamentale: il frontend usa questo per chiamare /finish
                 interviewId: interviewId ?? undefined
               }
             });
 
-            // ✅ Per la Live interview facciamo partire subito la prima domanda (come /start nella text interview)
             if (isInterview) {
               try {
                 await session.sendClientContent({
@@ -291,33 +397,19 @@ export function attachLiveWebSocketServer(server: http.Server) {
 
             if (sig.inputTranscription) {
               wsSend(ws, { type: "input_transcription", text: sig.inputTranscription });
-
-              if (isInterview && interviewId && shouldPersistTranscriptChunk(sig.inputTranscription)) {
-                const t = sig.inputTranscription.trim();
-                if (t && t !== lastSavedUserTr) {
-                  lastSavedUserTr = t;
-                  try {
-                    await addInterviewMessage(db, authUser.uid, interviewId, { role: "user", text: t });
-                  } catch (e) {
-                    wsSend(ws, { type: "error", error: `INTERVIEW_SAVE_INPUT_FAILED: ${normalizePrivateWsError(e)}` });
-                  }
-                }
+              if (isInterview && transcriptSaver) {
+                try {
+                  transcriptSaver.appendUserChunk(sig.inputTranscription);
+                } catch {}
               }
             }
 
             if (sig.outputTranscription) {
               wsSend(ws, { type: "output_transcription", text: sig.outputTranscription });
-
-              if (isInterview && interviewId && shouldPersistTranscriptChunk(sig.outputTranscription)) {
-                const t = sig.outputTranscription.trim();
-                if (t && t !== lastSavedAssistantTr) {
-                  lastSavedAssistantTr = t;
-                  try {
-                    await addInterviewMessage(db, authUser.uid, interviewId, { role: "assistant", text: t });
-                  } catch (e) {
-                    wsSend(ws, { type: "error", error: `INTERVIEW_SAVE_OUTPUT_FAILED: ${normalizePrivateWsError(e)}` });
-                  }
-                }
+              if (isInterview && transcriptSaver) {
+                try {
+                  transcriptSaver.appendAssistantChunk(sig.outputTranscription);
+                } catch {}
               }
             }
 
@@ -332,7 +424,10 @@ export function attachLiveWebSocketServer(server: http.Server) {
           onerror: (e: any) => {
             wsSend(ws, { type: "error", error: normalizePrivateWsError(e) });
           },
-          onclose: () => {
+          onclose: async () => {
+            try {
+              if (isInterview && transcriptSaver) await transcriptSaver.flushAll();
+            } catch {}
             try {
               ws.close(1000, "Live session closed");
             } catch {}
@@ -363,11 +458,19 @@ export function attachLiveWebSocketServer(server: http.Server) {
           }
 
           if (msg.type === "end_turn") {
+            if (isInterview && transcriptSaver) {
+              try {
+                await transcriptSaver.flushAll();
+              } catch {}
+            }
             await session.sendClientContent({ turns: [], turnComplete: true });
             return;
           }
 
           if (msg.type === "close") {
+            try {
+              if (isInterview && transcriptSaver) await transcriptSaver.flushAll();
+            } catch {}
             try {
               session.close();
             } catch {}
@@ -381,7 +484,12 @@ export function attachLiveWebSocketServer(server: http.Server) {
         }
       });
 
-      ws.on("close", () => {
+      ws.on("close", async () => {
+        clearInterval(pingInterval);
+        try {
+          // best-effort flush
+          if (isInterview && transcriptSaver) await transcriptSaver.flushAll();
+        } catch {}
         try {
           session.close();
         } catch {}
@@ -391,6 +499,7 @@ export function attachLiveWebSocketServer(server: http.Server) {
       try {
         ws.close(1011, "Server error");
       } catch {}
+      clearInterval(pingInterval);
     }
   });
 

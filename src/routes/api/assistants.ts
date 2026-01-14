@@ -40,6 +40,15 @@ const AvatarSpecSchema = z.object({
   clothingStyle: z.string().min(1).max(80)
 });
 
+// ✅ voci consentite (lato backend, per evitare valori strani)
+const VoiceNameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(40)
+  .default("Kore")
+  .transform((v) => v || "Kore");
+
 apiAssistantsRouter.get("/", async (req, res, next) => {
   try {
     const db = getFirestore();
@@ -64,7 +73,10 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
 
       avatarSpec: AvatarSpecSchema,
 
-      nsfwEnabled: z.boolean().default(false)
+      nsfwEnabled: z.boolean().default(false),
+
+      // ✅ NEW
+      voiceName: VoiceNameSchema.optional()
     });
 
     const input = Body.parse(req.body);
@@ -131,6 +143,9 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
 
       nsfwEnabled: input.nsfwEnabled,
 
+      // ✅ NEW: voce salvata
+      voiceName: (input.voiceName ?? "Kore").trim() || "Kore",
+
       isPublic: false,
       publishedAt: null,
 
@@ -140,7 +155,6 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
 
     await createAssistant(db, doc);
 
-    // Sanitizzazione profonda prima della risposta (anti-jq parse error)
     return res.status(201).json(sanitizeDeep({ ok: true, assistant: doc }));
   } catch (err) {
     return next(err);
@@ -174,7 +188,10 @@ apiAssistantsRouter.put("/:id", async (req, res, next) => {
 
       avatarSpec: AvatarSpecSchema.optional(),
 
-      nsfwEnabled: z.boolean().optional()
+      nsfwEnabled: z.boolean().optional(),
+
+      // ✅ NEW
+      voiceName: VoiceNameSchema.optional()
     });
 
     const patch = Body.parse(req.body);
@@ -192,7 +209,13 @@ apiAssistantsRouter.put("/:id", async (req, res, next) => {
       }
     }
 
-    const updated = await updateAssistant(db, req.params.id, patch);
+    // Normalizza voiceName se passato come stringa vuota
+    const fixedPatch: any = { ...patch };
+    if (typeof fixedPatch.voiceName === "string") {
+      fixedPatch.voiceName = fixedPatch.voiceName.trim() || "Kore";
+    }
+
+    const updated = await updateAssistant(db, req.params.id, fixedPatch);
     return res.status(200).json(sanitizeDeep({ ok: true, assistant: updated }));
   } catch (err) {
     return next(err);

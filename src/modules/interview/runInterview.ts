@@ -7,6 +7,28 @@ import type { UserProfile } from "../users/userRepo.js";
 import type { InterviewMessageDoc } from "./interviewRepo.js";
 import { buildInterviewSystemInstruction, guideName } from "./interviewPrompts.js";
 
+function normalizeSpaces(s: string) {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+function compactInterviewMessages(messages: InterviewMessageDoc[]) {
+  // Unisce messaggi consecutivi dello stesso role in blocchi coerenti.
+  const out: { role: "user" | "assistant"; text: string }[] = [];
+  for (const m of messages) {
+    const text = normalizeSpaces(m.text || "");
+    if (!text) continue;
+
+    const last = out[out.length - 1];
+    if (last && last.role === m.role) {
+      // concatena con spazio
+      last.text = normalizeSpaces(`${last.text} ${text}`);
+    } else {
+      out.push({ role: m.role, text });
+    }
+  }
+  return out;
+}
+
 export async function generateNextInterviewQuestion(opts: {
   user: UserProfile;
   interviewNsfwEnabled: boolean;
@@ -22,7 +44,6 @@ export async function generateNextInterviewQuestion(opts: {
 
   const allowExplicit = safetySettings[0]?.threshold === "BLOCK_NONE";
 
-  // ✅ System allineato e riusabile anche dalla Live interview
   const system = buildInterviewSystemInstruction({
     user: {
       name: opts.user.name,
@@ -35,7 +56,9 @@ export async function generateNextInterviewQuestion(opts: {
     allowExplicit
   });
 
-  const history = opts.messages
+  const compact = compactInterviewMessages(opts.messages);
+
+  const history = compact
     .map((m) => `${m.role === "assistant" ? guideName() : "Utente"}: ${m.text}`)
     .join("\n");
 
@@ -78,7 +101,10 @@ export async function generateInterviewSummaryBio(opts: {
 
   const allowExplicit = safetySettings[0]?.threshold === "BLOCK_NONE";
 
-  const transcript = opts.messages
+  // ✅ compattazione: riduce “word chunks” residui e rende il transcript leggibile
+  const compact = compactInterviewMessages(opts.messages);
+
+  const transcript = compact
     .map((m) => `${m.role === "assistant" ? guideName() : "Utente"}: ${m.text}`)
     .join("\n");
 
