@@ -37,7 +37,7 @@ export async function generateAssistantBio(opts: {
     `Stile: concreto, credibile, non generico, massimo 3000 caratteri.`,
     `L'assistente deve avere vita propria: Ciò significa che deve avere un proprio background, interessi, passioni, vita lavorativa o di studio, hobby, relazioni sociali ecc. I tratti della sua personalità devono emergere ed essere unici e distintivi per ogni personaggio creato.`,
     `Ogni personaggio si presuppone abbia anche una famiglia coerente con la sua storia e con la sua relazione con l'utente; parlane brevemente nella bio.`,
-    `Se nel contesto utente è presente una disabilità visiva, non cambiare la bio includendo frasi o menzioni che ne facciano esplicito riferimento.`,
+    `Se nel contesto utente è presente una disabilità visiva, non cambiare la bio includendo frasi o menzioni che ne facciano esplicito riferimento. Se il personaggio ha un nome appartenente ad una serie di romanzi, serie tv, film ecc, genera la bio in modo da imitare perfettamente tale personaggio, assumerne i comportamenti e renderlo un perfetto sosia. Nella generazione di persone reali varia molto tra gli interessi e gli stili; non soffermarti unicamente su hobby come fotografia analogica, o renderli tutti architetti o collezionisti di vinili. Spazia molto, rendi la bio credibile e varia tra le generazioni.`,
     `Contesto utente :`,
     `- Nome: ${opts.user.name} ${opts.user.surname}`,
     `- Età: ${opts.user.age ?? "n/d"}`,
