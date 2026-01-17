@@ -111,7 +111,7 @@ export async function generateInterviewSummaryBio(opts: {
   const prompt = [
     `Genera una BIO in italiano come riepilogo dell'intervista qui sotto.`,
     `Stile: utile, concreta, naturale, non generica. Max 5000 caratteri.`,
-    `La bio deve essere adatta a KNGLife e descrivere la persona, i suoi interessi, obiettivi, routine e preferenze.`,
+    `La bio deve essere adatta a KNGLife e descrivere la persona, i suoi interessi, obiettivi, routine e preferenze. Assicurati di includere tutti i dettagli raccolti durante l'intervista; ogni dettaglio, anche il più piccolo, è importante.`,
     allowExplicit
       ? `NSFW ON: puoi includere anche aspetti intimi/relazionali emersi nell'intervista.`
       : `NSFW OFF: evita dettagli espliciti.`,
