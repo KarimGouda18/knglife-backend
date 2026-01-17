@@ -34,14 +34,12 @@ function buildSystemContext(opts: {
 }
 
 function normalizeInlineBase64(input: string) {
-  // Se arriva "data:xxx;base64,AAAA", estraiamo solo la parte base64.
   const idx = input.indexOf("base64,");
   if (idx >= 0) return input.slice(idx + "base64,".length).trim();
   return input.trim();
 }
 
 function toGeminiRole(role: "user" | "assistant") {
-  // Il modello Gemini capisce "user" e "model". "assistant" spesso crea problemi con inlineData.
   return role === "assistant" ? ("model" as const) : ("user" as const);
 }
 
@@ -94,7 +92,6 @@ export async function runConversation(opts: {
   });
 
   const contents = [
-    // Mettiamo il contesto come primo messaggio utente (ok in Gemini)
     { role: "user" as const, parts: [{ text: systemText }] },
     ...opts.history.map((m) => ({
       role: toGeminiRole(m.role),
@@ -102,10 +99,14 @@ export async function runConversation(opts: {
     }))
   ];
 
+  // ✅ Google Search grounding anche per chat testuale: tools in config :contentReference[oaicite:4]{index=4}
   const resp = await ai.models.generateContent({
     model: env.GEMINI_TEXT_MODEL,
     contents,
-    config: { safetySettings }
+    config: {
+      safetySettings,
+      tools: [{ googleSearch: {} }]
+    }
   });
 
   const raw =

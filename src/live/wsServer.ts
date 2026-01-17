@@ -14,14 +14,16 @@ import { addInterviewMessage, createInterview, getInterview } from "../modules/i
 
 /**
  * Protocollo WS (client -> server):
- * - { type: "input_audio", dataBase64: string, mimeType?: string }  // default: audio/pcm;rate=16000
- * - { type: "input_text", text: string }                           // opzionale (debug)
- * - { type: "end_turn" }                                           // forza flush
+ * - { type: "input_audio", dataBase64: string, mimeType?: string }    // default: audio/pcm;rate=16000
+ * - { type: "input_video", dataBase64: string, mimeType?: string }    // tipico: image/jpeg (frame)
+ * - { type: "input_text", text: string }                              // opzionale (debug)
+ * - { type: "end_turn" }                                              // forza flush
  * - { type: "close" }
  *
  * Compatibilità extra (per non rompere client diversi):
  * - { type: "audio", dataBase64: string, mimeType?: string }
- * - { type: "realtime_input", audio: { dataBase64: string, mimeType?: string } }
+ * - { type: "video", dataBase64: string, mimeType?: string }
+ * - { type: "realtime_input", audio?: { dataBase64: string, mimeType?: string }, video?: { dataBase64: string, mimeType?: string } }
  *
  * Server -> client:
  * - { type: "ready", session: {...}, interviewId?: string }
@@ -35,7 +37,9 @@ import { addInterviewMessage, createInterview, getInterview } from "../modules/i
 type ClientMsg =
   | { type: "input_audio"; dataBase64: string; mimeType?: string }
   | { type: "audio"; dataBase64: string; mimeType?: string }
-  | { type: "realtime_input"; audio?: { dataBase64: string; mimeType?: string } }
+  | { type: "input_video"; dataBase64: string; mimeType?: string }
+  | { type: "video"; dataBase64: string; mimeType?: string }
+  | { type: "realtime_input"; audio?: { dataBase64: string; mimeType?: string }; video?: { dataBase64: string; mimeType?: string } }
   | { type: "input_text"; text: string }
   | { type: "end_turn" }
   | { type: "close" };
@@ -232,6 +236,30 @@ class TranscriptSaver {
   }
 }
 
+async function sendRealtimeVideoFrame(session: any, opts: { dataBase64: string; mimeType: string }) {
+  // Il doc parla di realtimeInput.video come blob/stream (concetto: frame come immagine) :contentReference[oaicite:2]{index=2}
+  // Nel JS SDK la shape può variare tra versioni: proviamo "video", poi fallback "mediaChunks".
+  const data = normalizeInlineBase64(opts.dataBase64);
+  const mimeType = opts.mimeType || "image/jpeg";
+
+  try {
+    await session.sendRealtimeInput({
+      video: { data, mimeType }
+    });
+    return;
+  } catch {}
+
+  // fallback legacy/deprecato ma spesso compatibile
+  try {
+    await session.sendRealtimeInput({
+      mediaChunks: [{ data, mimeType }]
+    });
+    return;
+  } catch (e) {
+    throw e;
+  }
+}
+
 export function attachLiveWebSocketServer(server: http.Server) {
   const wss = new WebSocketServer({ server });
 
@@ -244,23 +272,19 @@ export function attachLiveWebSocketServer(server: http.Server) {
       return;
     }
 
-    // keepalive ping
     const pingInterval = setInterval(() => {
       try {
         if (ws.readyState === ws.OPEN) ws.ping();
       } catch {}
     }, 25_000);
 
-    // ===== Assistant auto end-turn (VAD povero) =====
-    // Se il client non manda end_turn, noi chiudiamo il turno dopo un po' di silenzio.
     let vadTimer: NodeJS.Timeout | null = null;
     const VAD_SILENCE_MS = 850;
 
     const bumpVad = async (isInterview: boolean, session: any) => {
-      if (isInterview) return; // interview gestita dal client + transcriptSaver
+      if (isInterview) return;
       if (vadTimer) clearTimeout(vadTimer);
       vadTimer = setTimeout(() => {
-        // "fine turno": permette al modello di rispondere
         try {
           void session.sendClientContent({ turns: [], turnComplete: true });
         } catch {}
@@ -285,7 +309,6 @@ export function attachLiveWebSocketServer(server: http.Server) {
       let systemPrompt = "";
       let assistant: any = null;
 
-      // IMPORTANT: voice vale solo per Assistant, NON Interview
       let voiceName = "Kore";
 
       let interviewId: string | null = null;
@@ -350,7 +373,6 @@ export function attachLiveWebSocketServer(server: http.Server) {
           return;
         }
 
-        // voice: query override (solo assistant) > assistant.voiceName > Kore
         const voiceFromQuery = url.searchParams.get("voiceName");
         voiceName = (voiceFromQuery || pickVoiceName(assistant)).trim() || "Kore";
 
@@ -384,6 +406,9 @@ export function attachLiveWebSocketServer(server: http.Server) {
         assistantNsfwEnabled: isInterview ? interviewNsfwEnabled : (assistant?.nsfwEnabled ?? false)
       });
 
+      // ✅ Grounding Google Search su Live: tools in config :contentReference[oaicite:3]{index=3}
+      const tools = [{ googleSearch: {} }];
+
       const session = await ai.live.connect({
         model: env.GEMINI_REALTIME_MODEL,
         config: {
@@ -392,8 +417,8 @@ export function attachLiveWebSocketServer(server: http.Server) {
           safetySettings,
           inputAudioTranscription: {},
           outputAudioTranscription: {},
+          tools,
 
-          // ✅ voice SOLO per Assistant
           ...(isInterview
             ? {}
             : {
@@ -413,7 +438,8 @@ export function attachLiveWebSocketServer(server: http.Server) {
                 mode: isInterview ? "interview" : "assistant",
                 voiceName: isInterview ? undefined : voiceName,
                 model: env.GEMINI_REALTIME_MODEL,
-                interviewId: interviewId ?? undefined
+                interviewId: interviewId ?? undefined,
+                tools: ["googleSearch"]
               }
             });
 
@@ -490,15 +516,25 @@ export function attachLiveWebSocketServer(server: http.Server) {
             return;
           }
 
-          if (msg.type === "realtime_input" && msg.audio?.dataBase64) {
-            const mimeType = msg.audio.mimeType || "audio/pcm;rate=16000";
-            const data = normalizeInlineBase64(msg.audio.dataBase64);
+          // === VIDEO FRAME (camera/screen) ===
+          if (msg.type === "input_video" || msg.type === "video") {
+            const mimeType = msg.mimeType || "image/jpeg";
+            await sendRealtimeVideoFrame(session, { dataBase64: msg.dataBase64, mimeType });
+            return;
+          }
 
-            await session.sendRealtimeInput({
-              audio: { data, mimeType }
-            });
+          if (msg.type === "realtime_input") {
+            if (msg.audio?.dataBase64) {
+              const mimeType = msg.audio.mimeType || "audio/pcm;rate=16000";
+              const data = normalizeInlineBase64(msg.audio.dataBase64);
+              await session.sendRealtimeInput({ audio: { data, mimeType } });
+              await bumpVad(isInterview, session);
+            }
 
-            await bumpVad(isInterview, session);
+            if (msg.video?.dataBase64) {
+              const mimeType = msg.video.mimeType || "image/jpeg";
+              await sendRealtimeVideoFrame(session, { dataBase64: msg.video.dataBase64, mimeType });
+            }
             return;
           }
 
@@ -518,8 +554,6 @@ export function attachLiveWebSocketServer(server: http.Server) {
                 await transcriptSaver.flushAll();
               } catch {}
             }
-
-            // Forza fine turno anche per assistant
             await session.sendClientContent({ turns: [], turnComplete: true });
             return;
           }
