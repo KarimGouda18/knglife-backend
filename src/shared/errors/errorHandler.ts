@@ -1,30 +1,87 @@
 // src/shared/errors/errorHandler.ts
-import type { Request, Response, NextFunction } from "express";
+import type { ErrorRequestHandler } from "express";
+import { env } from "../../config/env.js";
 
-function safeErrorToString(err: unknown): string {
+function isProd() {
+  // Se hai un env diverso (es. env.NODE_ENV), adattalo qui.
+  // Con la tua codebase, env è validato da zod in config/env.ts.
+  // In caso non ci sia NODE_ENV in env, usa process.env.NODE_ENV.
+  const nodeEnv = (process.env.NODE_ENV ?? "").toLowerCase();
+  return nodeEnv === "production";
+}
+
+function safeString(v: unknown) {
+  if (typeof v === "string") return v;
+  if (v == null) return "";
   try {
-    if (err instanceof Error) {
-      return err.stack ?? err.message;
-    }
-    if (typeof err === "string") return err;
-    return JSON.stringify(err);
+    return String(v);
   } catch {
-    // fallback ultra-sicuro
-    return Object.prototype.toString.call(err);
+    return "";
   }
 }
 
-export function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFunction) {
-  // Non passiamo oggetti “strani” direttamente a console.error su Node 24.
-  // Usiamo una stringa safe.
+function pickErrorCode(err: any) {
+  // Firestore/Admin SDK spesso mette code come stringa o numero
+  return err?.code ?? err?.status ?? err?.statusCode ?? null;
+}
+
+function pickErrorMessage(err: any) {
+  return err?.message ?? err?.error?.message ?? "INTERNAL_SERVER_ERROR";
+}
+
+function pickErrorStack(err: any) {
+  return err?.stack ?? null;
+}
+
+function pickErrorDetails(err: any) {
+  // Alcuni errori Google APIs includono details/metadata
+  const details = err?.details ?? err?.error?.details ?? err?.response?.data ?? null;
+  return details ?? null;
+}
+
+export const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
+  const code = pickErrorCode(err);
+  const message = pickErrorMessage(err);
+
+  // Log server-side SEMPRE (utile anche in prod), ma senza secrets.
   // eslint-disable-next-line no-console
-  console.error("[knglife] error:", safeErrorToString(err));
+  console.error(
+    "[error]",
+    {
+      method: req.method,
+      path: req.originalUrl,
+      code,
+      message: safeString(message)
+    },
+    // stack in console (molto utile)
+    pickErrorStack(err)
+  );
 
-  // Zod error (supporta sia v3 che v4 senza dipendere da proprietà interne)
-  const maybeZod = err as any;
-  if (maybeZod && typeof maybeZod === "object" && Array.isArray(maybeZod.issues)) {
-    return res.status(400).json({ ok: false, error: "BAD_REQUEST", details: maybeZod.issues });
+  const status =
+    typeof err?.statusCode === "number"
+      ? err.statusCode
+      : typeof err?.status === "number"
+        ? err.status
+        : 500;
+
+  // ✅ In produzione: risposta minimal
+  if (isProd()) {
+    return res.status(status).json({
+      ok: false,
+      error: status === 404 ? "NOT_FOUND" : "INTERNAL_SERVER_ERROR"
+    });
   }
 
-  return res.status(500).json({ ok: false, error: "INTERNAL_SERVER_ERROR" });
-}
+  // ✅ In dev: risposta con dettagli utili per debugging
+  return res.status(status).json({
+    ok: false,
+    error: status === 404 ? "NOT_FOUND" : "INTERNAL_SERVER_ERROR",
+    debug: {
+      status,
+      code,
+      message: safeString(message),
+      stack: pickErrorStack(err),
+      details: pickErrorDetails(err)
+    }
+  });
+};
