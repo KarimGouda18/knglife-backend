@@ -1,6 +1,7 @@
 // src/routes/api/conversations.ts
 import { Router } from "express";
 import { z } from "zod";
+import multer from "multer";
 import { requireAuth } from "../../shared/middleware/requireAuth.js";
 import { getFirestore } from "../../config/firebase.js";
 import { getAssistant } from "../../modules/assistants/assistantsRepo.js";
@@ -17,9 +18,16 @@ import {
 import { runConversation } from "../../modules/conversations/runConversation.js";
 import { sanitizeDeep } from "../../shared/utils/sanitizeDeep.js";
 import { generateConversationImage, generateConversationVideo } from "../../modules/conversations/mediaGen.js";
+import { uploadBytesToStorage } from "../../shared/utils/storage.js";
 
 export const apiConversationsRouter = Router();
 apiConversationsRouter.use(requireAuth);
+
+// Upload (PDF/TXT/whatever) -> Storage -> ritorna downloadUrl da usare come file_url
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 } // 25MB (Cloud Run-friendly)
+});
 
 const PartsSchema = z.array(
   z.union([
@@ -29,7 +37,6 @@ const PartsSchema = z.array(
       mimeType: z.string().min(1),
       dataBase64: z.string().min(1)
     }),
-    // ✅ nuovo: file_url (displayName è opzionale e NON verrà passato a Gemini)
     z.object({
       type: z.literal("file_url"),
       mimeType: z.string().min(1),
@@ -121,6 +128,46 @@ apiConversationsRouter.get("/:id/messages", async (req, res, next) => {
   }
 });
 
+/**
+ * POST /api/conversations/:id/upload
+ * multipart/form-data field: file
+ */
+apiConversationsRouter.post("/:id/upload", upload.single("file"), async (req, res, next) => {
+  try {
+    const db = getFirestore();
+
+    const convo = await getConversation(db, req.params.id);
+    if (!convo || convo.ownerUid !== req.user!.uid) {
+      return res.status(404).json({ ok: false, error: "CONVERSATION_NOT_FOUND" });
+    }
+
+    const file = req.file;
+    if (!file) return res.status(400).json({ ok: false, error: "FILE_REQUIRED" });
+
+    const mimeType = file.mimetype || "application/octet-stream";
+    const displayName = file.originalname || "upload.bin";
+
+    const path = `conversations/${req.user!.uid}/${convo.id}/uploads/${Date.now()}-${displayName}`;
+
+    const uploaded = await uploadBytesToStorage({
+      path,
+      bytes: Buffer.from(file.buffer),
+      contentType: mimeType
+    });
+
+    return res.status(200).json(
+      sanitizeDeep({
+        ok: true,
+        mimeType,
+        displayName,
+        file: uploaded
+      })
+    );
+  } catch (err) {
+    return next(err);
+  }
+});
+
 apiConversationsRouter.post("/:id/message", async (req, res, next) => {
   try {
     const Body = z.object({ parts: PartsSchema });
@@ -170,9 +217,7 @@ apiConversationsRouter.post("/:id/message", async (req, res, next) => {
       parts: [{ type: "text", text: reply }]
     });
 
-    return res
-      .status(200)
-      .json(sanitizeDeep({ ok: true, userMessage: userMsg, assistantMessage: assistantMsg }));
+    return res.status(200).json(sanitizeDeep({ ok: true, userMessage: userMsg, assistantMessage: assistantMsg }));
   } catch (err) {
     return next(err);
   }
@@ -215,8 +260,8 @@ apiConversationsRouter.post("/:id/generate/image", async (req, res, next) => {
 
     const msg = await addMessage(db, convo.id, {
       role: "assistant",
-      content: `Ho generato un'immagine: ${media.downloadUrl}`,
-      parts: [{ type: "text", text: `Ho generato un'immagine: ${media.downloadUrl}` }]
+      content: `Ho generato un immagine: ${media.downloadUrl}`,
+      parts: [{ type: "text", text: `Ho generato un immagine: ${media.downloadUrl}` }]
     });
 
     return res.status(200).json(sanitizeDeep({ ok: true, media, message: msg }));

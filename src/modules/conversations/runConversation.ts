@@ -31,7 +31,8 @@ function buildSystemContext(opts: {
     `- Rispondi in italiano.`,
     `- Sii coerente con età/genere/relazione dell'assistente.`,
     `- Se l'utente carica allegati, analizzali e rispondi.`,
-    `- Se l'utente chiede di aggiungere dati alla bio, NON modificare nulla da solo: proponi una patch testuale e attendi conferma.`,
+    `- Se NON riesci a leggere un allegato (es. PDF non accessibile), devi dirlo chiaramente e spiegare cosa ti serve.`,
+    `- Non restituire mai una risposta vuota.`,
     ``,
     `Profili (JSON):`,
     JSON.stringify(payload)
@@ -62,7 +63,6 @@ function mapPartsToGemini(parts: MessagePart[]) {
     }
 
     if (p.type === "file_url") {
-      // ✅ Gemini NON accetta displayName in fileData/file_data (era il tuo 400)
       return {
         fileData: {
           fileUri: p.url,
@@ -73,6 +73,16 @@ function mapPartsToGemini(parts: MessagePart[]) {
 
     return { text: "" };
   });
+}
+
+function extractTextFromResp(resp: any): string {
+  const text =
+    resp?.candidates?.[0]?.content?.parts
+      ?.map((p: any) => p?.text)
+      .filter(Boolean)
+      .join("") ?? "";
+
+  return typeof text === "string" ? text : "";
 }
 
 export async function runConversation(opts: {
@@ -128,11 +138,21 @@ export async function runConversation(opts: {
     }
   });
 
-  const raw =
-    resp.candidates?.[0]?.content?.parts
-      ?.map((p: any) => p.text)
-      .filter(Boolean)
-      .join("") ?? "";
+  const raw = extractTextFromResp(resp);
+  const cleaned = sanitizeForJson(raw).trim();
 
-  return sanitizeForJson(raw).trim();
+  if (!cleaned) {
+    // ✅ Non salvare mai risposta vuota: rendi l’errore debuggabile
+    const finishReason = resp?.candidates?.[0]?.finishReason ?? null;
+    const promptFeedback = resp?.promptFeedback ?? null;
+    const safetyRatings = resp?.candidates?.[0]?.safetyRatings ?? null;
+
+    throw new Error(
+      `EMPTY_MODEL_RESPONSE: finishReason=${JSON.stringify(finishReason)} promptFeedback=${JSON.stringify(
+        promptFeedback
+      )} safetyRatings=${JSON.stringify(safetyRatings)}`
+    );
+  }
+
+  return cleaned;
 }

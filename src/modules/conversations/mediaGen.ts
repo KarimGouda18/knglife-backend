@@ -36,36 +36,58 @@ function extractFilesNameFromUri(uri: string): string | null {
   return m?.[1] ?? null;
 }
 
-async function downloadGenaiFileToBuffer(opts: {
-  uri?: string;
-  name?: string;
-}): Promise<Buffer> {
-  const ai = getGenAI();
+async function fetchVideoByUri(uri: string): Promise<Buffer> {
+  // Fallback robusto: scarica direttamente la URI con API key
+  const res = await fetch(uri, {
+    headers: { "x-goog-api-key": env.GEMINI_API_KEY }
+  });
+  if (!res.ok) throw new Error(`VIDEO_DOWNLOAD_FAILED_FETCH: ${res.status} ${res.statusText}`);
+  const ab = await res.arrayBuffer();
+  return Buffer.from(ab);
+}
 
-  // 1) se abbiamo name (files/xxxx) usiamo ai.files.download (consigliato)
+async function downloadGenaiFileToBuffer(opts: { uri?: string; name?: string }): Promise<Buffer> {
+  const ai = getGenAI();
+  const fs = await import("node:fs/promises");
+
+  // 1) Se ho name (files/xxxx), provo ai.files.download -> tmp -> readFile
   if (opts.name) {
     const tmpPath = `/tmp/${newId()}.bin`;
-    await ai.files.download({ file: opts.name, downloadPath: tmpPath }); // :contentReference[oaicite:1]{index=1}
-    const fs = await import("node:fs/promises");
-    const bytes = await fs.readFile(tmpPath);
     try {
-      await fs.unlink(tmpPath);
-    } catch {
-      // ignore
+      await ai.files.download({ file: opts.name, downloadPath: tmpPath });
+
+      // ✅ Cloud Run / ambienti strani: verifica esistenza prima di readFile
+      await fs.access(tmpPath);
+      const bytes = await fs.readFile(tmpPath);
+      try {
+        await fs.unlink(tmpPath);
+      } catch {
+        // ignore
+      }
+
+      if (!bytes || bytes.length === 0) {
+        // se è vuoto, fallback fetch
+        if (opts.uri) return await fetchVideoByUri(opts.uri);
+        throw new Error("VIDEO_DOWNLOAD_FAILED_EMPTY_FILE");
+      }
+
+      return Buffer.from(bytes);
+    } catch (e: any) {
+      // ✅ Se download non crea il file (ENOENT) o fallisce: fallback su fetch(uri)
+      try {
+        // pulizia best-effort
+        await fs.unlink(tmpPath);
+      } catch {
+        // ignore
+      }
+      if (opts.uri) return await fetchVideoByUri(opts.uri);
+      throw new Error(`VIDEO_DOWNLOAD_FAILED_GENAI: ${e?.message ?? String(e)}`);
     }
-    return Buffer.from(bytes);
   }
 
-  // 2) fallback: fetch diretto della uri (con API key)
+  // 2) Se non ho name, provo direttamente fetch(uri)
   if (opts.uri) {
-    const res = await fetch(opts.uri, {
-      headers: {
-        "x-goog-api-key": env.GEMINI_API_KEY
-      }
-    });
-    if (!res.ok) throw new Error(`VIDEO_DOWNLOAD_FAILED: ${res.status} ${res.statusText}`);
-    const ab = await res.arrayBuffer();
-    return Buffer.from(ab);
+    return await fetchVideoByUri(opts.uri);
   }
 
   throw new Error("VIDEO_GENERATION_FAILED_NO_FILE_NAME");
@@ -194,13 +216,9 @@ export async function generateConversationVideo(opts: {
   const generated = operation?.response?.generatedVideos?.[0];
   const video = generated?.video;
 
-  // Forme note:
-  // - { uri: ".../v1beta/files/<id>:download?alt=media", mimeType?, videoBytes? }
-  // - oppure un File con { name: "files/<id>", ... }
   const uri: string | undefined = video?.uri;
-  const name: string | undefined = video?.name ?? extractFilesNameFromUri(uri ?? "");
+  const name: string | undefined = video?.name ?? (uri ? extractFilesNameFromUri(uri) ?? undefined : undefined);
 
-  // Se il backend ti logga "VIDEO_GENERATION_FAILED_NO_FILE_NAME" era qui.
   const bytes =
     typeof video?.videoBytes === "string" && video.videoBytes.length > 0
       ? Buffer.from(video.videoBytes, "base64")
