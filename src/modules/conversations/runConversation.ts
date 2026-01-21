@@ -25,8 +25,11 @@ function buildSystemContext(opts: {
     `Regole:`,
     `- Rispondi in italiano.`,
     `- Sii coerente con età/genere/relazione dell'assistente.`,
-    `- Se l'utente carica allegati (inline data), analizzali e rispondi.`,
+    `- Se l'utente carica allegati, analizzali e rispondi.`,
     `- Se l'utente chiede di aggiungere dati alla bio, NON modificare nulla da solo: proponi una patch testuale e attendi conferma.`,
+    `- Data e ora correnti (Europe/Rome): ${new Date().toLocaleString("it-IT", {
+      timeZone: "Europe/Rome"
+    })} (ISO: ${new Date().toISOString()})`,
     ``,
     `Profili (JSON):`,
     JSON.stringify(payload)
@@ -46,12 +49,30 @@ function toGeminiRole(role: "user" | "assistant") {
 function mapPartsToGemini(parts: MessagePart[]) {
   return parts.map((p) => {
     if (p.type === "text") return { text: p.text };
-    return {
-      inlineData: {
-        mimeType: p.mimeType,
-        data: normalizeInlineBase64(p.dataBase64)
-      }
-    };
+
+    if (p.type === "inline_data") {
+      return {
+        inlineData: {
+          mimeType: p.mimeType,
+          data: normalizeInlineBase64(p.dataBase64)
+        }
+      };
+    }
+
+    // ✅ IMPORTANTISSIMO:
+    // Gemini accetta SOLO { fileData: { fileUri, mimeType } }
+    // e NON accetta displayName dentro fileData.
+    if (p.type === "file_url") {
+      return {
+        fileData: {
+          fileUri: p.url,
+          mimeType: p.mimeType
+        }
+      };
+    }
+
+    // exhaustive guard
+    return { text: "" };
   });
 }
 
@@ -99,7 +120,6 @@ export async function runConversation(opts: {
     }))
   ];
 
-  // ✅ Google Search grounding anche per chat testuale: tools in config :contentReference[oaicite:4]{index=4}
   const resp = await ai.models.generateContent({
     model: env.GEMINI_TEXT_MODEL,
     contents,

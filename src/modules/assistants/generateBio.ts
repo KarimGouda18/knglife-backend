@@ -9,9 +9,12 @@ import type { UserProfile } from "../users/userRepo.js";
 export async function generateAssistantBio(opts: {
   assistant: Pick<
     AssistantDoc,
-    "name" | "surname" | "age" | "gender" | "relationship" | "nsfwEnabled" | "avatarSpec"
+    "name" | "surname" | "age" | "gender" | "relationship" | "nsfwEnabled" | "avatarSpec" | "persona"
   >;
-  user: Pick<UserProfile, "name" | "surname" | "gender" | "visualDisabilityLevel" | "birthDate" | "age" | "nsfwEnabled">;
+  user: Pick<
+    UserProfile,
+    "name" | "surname" | "gender" | "visualDisabilityLevel" | "birthDate" | "age" | "nsfwEnabled"
+  >;
 }): Promise<string> {
   const ai = getGenAI();
 
@@ -26,34 +29,55 @@ export async function generateAssistantBio(opts: {
   const nsfwInstruction = allowExplicit
     ? [
         "La bio può includere dettagli intimi, desideri espliciti e specifici, coerenti con la relazione con l’utente.",
-        "Includi questi dettagli in modo naturale e realistico nel background dell'assistente. Non ti preoccupare del linguaggio e non aver paura ad usare termini espliciti se coerenti con la tua relazione con l'utente.",
-        "Questo non deve sostituire i tuoi interessi o passioni, deve essere un'aggiunta a cui dedicare spazio alla fine della bio."
+        "Includi questi dettagli in modo naturale e realistico nel background dell'assistente.",
+        "Non ti preoccupare del linguaggio e non aver paura a usare termini espliciti se coerenti con la relazione.",
+        "Questo non deve sostituire interessi o passioni: è un'aggiunta a cui dedicare spazio alla fine della bio."
       ].join(" ")
     : "";
+
+  const p = opts.assistant.persona ?? null;
 
   const prompt = [
     `Scrivi una BIO realistica (background/persona) per un assistente AI che rappresenta una persona vera.`,
     `Lingua: italiano.`,
     `Stile: concreto, credibile, non generico, massimo 3000 caratteri.`,
-    `L'assistente deve avere vita propria: Ciò significa che deve avere un proprio background, interessi, passioni, vita lavorativa o di studio, hobby, relazioni sociali ecc. I tratti della sua personalità devono emergere ed essere unici e distintivi per ogni personaggio creato.`,
-    `Ogni personaggio si presuppone abbia anche una famiglia coerente con la sua storia e con la sua relazione con l'utente; parlane brevemente nella bio.`,
-    `Se nel contesto utente è presente una disabilità visiva, non cambiare la bio includendo frasi o menzioni che ne facciano esplicito riferimento. Se il personaggio ha un nome appartenente ad una serie di romanzi, serie tv, film ecc, genera la bio in modo da imitare perfettamente tale personaggio, assumerne i comportamenti e renderlo un perfetto sosia. Nella generazione di persone reali varia molto tra gli interessi e gli stili; non soffermarti unicamente su hobby come fotografia analogica, o renderli tutti architetti o collezionisti di vinili. Spazia molto, rendi la bio credibile e varia tra le generazioni.`,
-    `Contesto utente :`,
+    `L'assistente deve avere vita propria: background, interessi, passioni, lavoro/studio, hobby, relazioni sociali.`,
+    `Ogni personaggio ha una famiglia coerente con la sua storia e con la sua relazione con l'utente; parlane brevemente.`,
+    `Se nel contesto utente è presente una disabilità visiva, non cambiare la bio includendo frasi o menzioni che ne facciano esplicito riferimento.`,
+    `Se il personaggio è ispirato a personaggi reali/fictional (o un “sosia”), imitalo in modo credibile e coerente con i parametri forniti, senza risultare stereotipato.`,
+    `Varia molto tra generazioni, professioni e interessi. Evita strutture predefinite e frasi fatte.`,
+    ``,
+    `Contesto utente:`,
     `- Nome: ${opts.user.name} ${opts.user.surname}`,
     `- Età: ${opts.user.age ?? "n/d"}`,
     `- Genere: ${opts.user.gender ?? "n/d"}`,
     `- Disabilità visiva: ${opts.user.visualDisabilityLevel}`,
     `- NSFW profilo: ${opts.user.nsfwEnabled ? "ON" : "OFF"}`,
     ``,
-    `Dati assistente:`,
+    `Dati assistente (base):`,
     `- Nome: ${opts.assistant.name} ${opts.assistant.surname}`,
     `- Età: ${opts.assistant.age}`,
     `- Genere: ${opts.assistant.gender}`,
     `- Relazione con l'utente: ${opts.assistant.relationship}`,
-    ``,
     `- NSFW assistente: ${opts.assistant.nsfwEnabled ? "ON" : "OFF"}`,
-    `Regola: non fare mai riferimento all'utente nella bio; i dati che ti ho creato servono unicamente per adatare il tono in cui la scrivi. Devi parlare come se il personaggio si rivolgesse a un pubblico generico, quasi come se scrivesse un articolo.`,
-    `Regola: Evita di ripetere stesse frasi o concetti più volte; rendi la bio scorrevole e interessante. Non seguire strutture predefinite, stereotipi o frasi fatte, sii creativo e originale.`,
+    ``,
+    `Parametri extra (opzionali, possono essere vuoti):`,
+    `- IdentityType: ${p?.identityType ?? "n/d"}`,
+    `- SourceMaterial: ${p?.sourceMaterial ?? "n/d"}`,
+    `- Personalità: ${p?.personality ?? "n/d"}`,
+    `- Professione/Studi: ${p?.profession ?? "n/d"}`,
+    `- Backstory: ${p?.backstory ?? "n/d"}`,
+    `- Tratti distintivi: ${p?.traits ?? "n/d"}`,
+    `- Interessi: ${p?.interests ?? "n/d"}`,
+    `- Valori: ${p?.values ?? "n/d"}`,
+    `- Stile di linguaggio: ${p?.speakingStyle ?? "n/d"}`,
+    `- Obiettivi: ${p?.goals ?? "n/d"}`,
+    `- Note sulla famiglia: ${p?.familyNotes ?? "n/d"}`,
+    `- Luogo/ambientazione: ${p?.location ?? "n/d"}`,
+    `- Altre note: ${p?.otherNotes ?? "n/d"}`,
+    ``,
+    `Regola: non fare mai riferimento all'utente nella bio; i dati utente servono solo per adattare il tono.`,
+    `Devi parlare come se il personaggio si rivolgesse a un pubblico generico, quasi come se scrivesse un articolo.`,
     nsfwInstruction,
     ``,
     `Output: solo la bio, senza titolo, senza virgolette.`
@@ -67,7 +91,7 @@ export async function generateAssistantBio(opts: {
 
   const raw =
     resp.candidates?.[0]?.content?.parts
-      ?.map((p: any) => p.text)
+      ?.map((pp: any) => pp.text)
       .filter(Boolean)
       .join("") ?? "";
 

@@ -20,6 +20,23 @@ export type AssistantAvatar = {
   downloadUrl: string;
 };
 
+export type AssistantPersona = {
+  // ✅ Tutti opzionali, tutte stringhe (come richiesto)
+  personality?: string | null; // tratti/temperamento
+  profession?: string | null; // lavoro/studi
+  identityType?: string | null; // "reale", "fictional", "original", "celebrity", ecc (stringa libera)
+  sourceMaterial?: string | null; // opera/contesto se fictional o ispirato
+  backstory?: string | null;
+  traits?: string | null;
+  interests?: string | null;
+  values?: string | null;
+  speakingStyle?: string | null; // tono/registro/lessico
+  goals?: string | null;
+  familyNotes?: string | null;
+  location?: string | null;
+  otherNotes?: string | null;
+};
+
 export type AssistantDoc = {
   id: string;
 
@@ -41,6 +58,9 @@ export type AssistantDoc = {
 
   // ✅ Live voice per ASSISTANT (non interview)
   voiceName: string;
+
+  // ✅ Nuovi campi per persona/backstory (opzionali)
+  persona?: AssistantPersona | null;
 
   isPublic: boolean;
   publishedAt: string | null;

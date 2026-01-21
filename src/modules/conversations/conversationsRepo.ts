@@ -4,7 +4,8 @@ import crypto from "node:crypto";
 
 export type MessagePart =
   | { type: "text"; text: string }
-  | { type: "inline_data"; mimeType: string; dataBase64: string };
+  | { type: "inline_data"; mimeType: string; dataBase64: string }
+  | { type: "file_url"; mimeType: string; url: string; displayName?: string };
 
 export type MessageDoc = {
   id: string;
@@ -19,7 +20,8 @@ export type ConversationDoc = {
   ownerUid: string;
   assistantId: string;
   title: string | null;
-  nsfwEnabled: boolean; // snapshot dall'assistente
+  summary?: string | null;
+  nsfwEnabled: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -60,9 +62,27 @@ export async function listOwnerConversations(db: Firestore, ownerUid: string, li
   return q.docs.map((d) => d.data() as ConversationDoc);
 }
 
+/**
+ * Lista conversazioni per assistantId (utile per cascade delete su assistant).
+ * Nota: può richiedere un composite index (Firestore ti fornisce il link).
+ */
+export async function listOwnerConversationsByAssistant(
+  db: Firestore,
+  ownerUid: string,
+  assistantId: string,
+  limit = 200
+) {
+  const q = await conversationsCol(db)
+    .where("ownerUid", "==", ownerUid)
+    .where("assistantId", "==", assistantId)
+    .orderBy("updatedAt", "desc")
+    .limit(limit)
+    .get();
+
+  return q.docs.map((d) => d.data() as ConversationDoc);
+}
+
 export async function deleteConversation(db: Firestore, id: string) {
-  // Nota: per semplicità v1 non cancelliamo in cascata i messaggi.
-  // In seguito possiamo usare Cloud Functions / scheduled cleanup.
   await conversationsCol(db).doc(id).delete();
 }
 
@@ -80,4 +100,33 @@ export async function addMessage(
 export async function listMessages(db: Firestore, conversationId: string, limit = 40) {
   const q = await messagesCol(db, conversationId).orderBy("createdAt", "asc").limit(limit).get();
   return q.docs.map((d) => d.data() as MessageDoc);
+}
+
+/**
+ * Cancella una conversazione + tutti i messaggi (subcollection).
+ * Best-effort ma robusto: cancellazione a batch per evitare limiti.
+ */
+export async function deleteConversationCascade(db: Firestore, conversationId: string) {
+  const convoRef = conversationsCol(db).doc(conversationId);
+
+  // Cancella messages a chunk
+  const col = convoRef.collection("messages");
+  const chunkSize = 200;
+
+  // loop finché ci sono docs
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const snap = await col.orderBy("createdAt", "asc").limit(chunkSize).get();
+    if (snap.empty) break;
+
+    const batch = db.batch();
+    snap.docs.forEach((d) => batch.delete(d.ref));
+    await batch.commit();
+
+    // Se abbiamo letto meno del chunkSize, era l’ultimo giro
+    if (snap.size < chunkSize) break;
+  }
+
+  // Poi cancella la conversazione
+  await convoRef.delete();
 }

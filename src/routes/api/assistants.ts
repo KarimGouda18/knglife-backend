@@ -13,12 +13,18 @@ import {
   publishAssistant,
   unpublishAssistant,
   updateAssistant,
-  type AssistantDoc
+  type AssistantDoc,
+  type AssistantPersona
 } from "../../modules/assistants/assistantsRepo.js";
 import { generateAssistantBio } from "../../modules/assistants/generateBio.js";
 import { generateAndUploadAssistantAvatar } from "../../modules/assistants/generateAvatar.js";
 import { computeAgeFromBirthDate } from "../../shared/utils/safety.js";
 import { sanitizeDeep } from "../../shared/utils/sanitizeDeep.js";
+import {
+  deleteConversationCascade,
+  listOwnerConversationsByAssistant
+} from "../../modules/conversations/conversationsRepo.js";
+import { assistantMemoriesCol } from "../../modules/assistants/assistantMemory.js";
 
 export const apiAssistantsRouter = Router();
 apiAssistantsRouter.use(requireAuth);
@@ -47,6 +53,42 @@ const VoiceNameSchema = z
   .transform((s) => s.trim())
   .default("Kore");
 
+const OptionalStr = (max = 2000) =>
+  z
+    .string()
+    .max(max)
+    .optional()
+    .transform((s) => (typeof s === "string" ? s.trim() : s))
+    .refine((s) => s === undefined || s.length <= max, "STRING_TOO_LONG");
+
+const PersonaSchema = z
+  .object({
+    personality: OptionalStr(2000),
+    profession: OptionalStr(2000),
+    identityType: OptionalStr(200),
+    sourceMaterial: OptionalStr(400),
+    backstory: OptionalStr(4000),
+    traits: OptionalStr(2000),
+    interests: OptionalStr(2000),
+    values: OptionalStr(2000),
+    speakingStyle: OptionalStr(2000),
+    goals: OptionalStr(2000),
+    familyNotes: OptionalStr(2000),
+    location: OptionalStr(2000),
+    otherNotes: OptionalStr(4000)
+  })
+  .partial()
+  .optional();
+
+function normalizePersona(p?: Partial<AssistantPersona> | undefined): AssistantPersona | null | undefined {
+  if (!p) return undefined;
+  const cleaned: any = {};
+  for (const [k, v] of Object.entries(p)) {
+    if (typeof v === "string" && v.trim()) cleaned[k] = v.trim();
+  }
+  return Object.keys(cleaned).length ? (cleaned as AssistantPersona) : null;
+}
+
 apiAssistantsRouter.get("/", async (req, res, next) => {
   try {
     const db = getFirestore();
@@ -74,7 +116,10 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
       nsfwEnabled: z.boolean().default(false),
 
       // ✅ VOCE LIVE ASSISTANT
-      voiceName: VoiceNameSchema.optional()
+      voiceName: VoiceNameSchema.optional(),
+
+      // ✅ nuovi campi opzionali (persona)
+      persona: PersonaSchema
     });
 
     const input = Body.parse(req.body);
@@ -90,7 +135,9 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
     const now = new Date().toISOString();
 
     const voiceName = (input.voiceName ?? "Kore").trim() || "Kore";
+    const persona = normalizePersona(input.persona);
 
+    // ✅ se manual -> resta quello dell'utente; se auto -> generazione con persona
     let bio = input.bioMode === "manual" ? (input.bio ?? "").trim() : "";
     if (input.bioMode === "auto") {
       bio = await generateAssistantBio({
@@ -101,7 +148,8 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
           gender: input.gender,
           relationship: input.relationship,
           nsfwEnabled: input.nsfwEnabled,
-          avatarSpec: input.avatarSpec
+          avatarSpec: input.avatarSpec,
+          persona: persona ?? null
         },
         user: {
           name: userProfile.name,
@@ -143,8 +191,10 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
 
       nsfwEnabled: input.nsfwEnabled,
 
-      // ✅ persist voice
       voiceName,
+
+      // ✅ optional persona
+      ...(persona !== undefined ? { persona } : {}),
 
       isPublic: false,
       publishedAt: null,
@@ -190,11 +240,12 @@ apiAssistantsRouter.put("/:id", async (req, res, next) => {
 
       nsfwEnabled: z.boolean().optional(),
 
-      // ✅ VOCE LIVE ASSISTANT (update)
-      voiceName: z.string().min(1).max(40).optional()
+      voiceName: z.string().min(1).max(40).optional(),
+
+      persona: PersonaSchema
     });
 
-    const patch = Body.parse(req.body);
+    const patch = Body.parse(req.body) as any;
 
     const db = getFirestore();
     const existing = await getAssistant(db, req.params.id);
@@ -213,6 +264,14 @@ apiAssistantsRouter.put("/:id", async (req, res, next) => {
       patch.voiceName = patch.voiceName.trim() || "Kore";
     }
 
+    // normalizza persona
+    if ("persona" in patch) {
+      const persona = normalizePersona(patch.persona);
+      patch.persona = persona === undefined ? undefined : persona;
+      // se persona è undefined, non vogliamo scrivere undefined in Firestore
+      if (patch.persona === undefined) delete patch.persona;
+    }
+
     const updated = await updateAssistant(db, req.params.id, patch);
     return res.status(200).json(sanitizeDeep({ ok: true, assistant: updated }));
   } catch (err) {
@@ -226,6 +285,19 @@ apiAssistantsRouter.delete("/:id", async (req, res, next) => {
     const existing = await getAssistant(db, req.params.id);
     if (!existing || existing.ownerUid !== req.user!.uid) {
       return res.status(404).json({ ok: false, error: "ASSISTANT_NOT_FOUND" });
+    }
+
+    // ✅ Cascade delete: elimina tutte le conversazioni associate (e messaggi)
+    const convos = await listOwnerConversationsByAssistant(db, req.user!.uid, existing.id, 200);
+    for (const c of convos) {
+      await deleteConversationCascade(db, c.id);
+    }
+
+    // ✅ elimina memoria assistant (best-effort)
+    try {
+      await assistantMemoriesCol(db).doc(existing.id).delete();
+    } catch {
+      // ignore
     }
 
     await deleteAssistant(db, req.params.id);
@@ -286,7 +358,8 @@ apiAssistantsRouter.post("/:id/bio/generate", async (req, res, next) => {
         gender: existing.gender,
         relationship: existing.relationship,
         nsfwEnabled: existing.nsfwEnabled,
-        avatarSpec: existing.avatarSpec
+        avatarSpec: existing.avatarSpec,
+        persona: existing.persona ?? null
       },
       user: {
         name: userProfile.name,

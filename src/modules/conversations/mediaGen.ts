@@ -6,15 +6,13 @@ import { getGeminiSafetySettings } from "../../shared/utils/safety.js";
 import { uploadBytesToStorage } from "../../shared/utils/storage.js";
 import type { UserProfile } from "../users/userRepo.js";
 import type { AssistantDoc } from "../assistants/assistantsRepo.js";
+import { getStorage } from "../../config/firebase.js";
 
 function newId() {
   return crypto.randomUUID();
 }
 
 function normalizeVeoModelName(model: string) {
-  // Permette di usare "veo-3.1" in env senza rompere tutto:
-  // se il tuo account accetta già "veo-3.1" allora non cambia nulla,
-  // ma se richiede il suffisso generate-preview, lo aggiunge.
   if (model === "veo-3.1") return "veo-3.1-generate-preview";
   return model;
 }
@@ -25,6 +23,12 @@ async function fetchAsBase64(url: string): Promise<{ base64: string; mimeType: s
   const mimeType = res.headers.get("content-type") || "image/jpeg";
   const ab = await res.arrayBuffer();
   return { base64: Buffer.from(ab).toString("base64"), mimeType };
+}
+
+async function readStoragePathAsBase64(bucketName: string, objectPath: string): Promise<{ base64: string }> {
+  const bucket = getStorage().bucket(bucketName);
+  const [buf] = await bucket.file(objectPath).download();
+  return { base64: Buffer.from(buf).toString("base64") };
 }
 
 function guessImageExt(mime: string) {
@@ -57,14 +61,21 @@ export async function generateConversationImage(opts: {
   let resp: any;
 
   if (useRef) {
-    const { base64, mimeType } = await fetchAsBase64(opts.assistant.avatar!.downloadUrl);
-
+    // ✅ Niente base64: usa fileData con URL (più stabile e coerente col nuovo sistema allegati)
     resp = await ai.models.generateContent({
       model: env.GEMINI_IMAGE_MODEL,
       contents: [
         {
           role: "user",
-          parts: [{ text: opts.prompt }, { inlineData: { data: base64, mimeType } }]
+          parts: [
+            { text: opts.prompt },
+            {
+              fileData: {
+                fileUri: opts.assistant.avatar!.downloadUrl,
+                mimeType: opts.assistant.avatar!.contentType || "image/png"
+              }
+            }
+          ]
         }
       ],
       config: {
@@ -83,7 +94,6 @@ export async function generateConversationImage(opts: {
     });
   }
 
-  // Supportiamo più forme di risposta possibili (SDK cambia spesso forma tra preview)
   const bytesBase64: string | undefined =
     resp?.generatedImages?.[0]?.image?.imageBytes ??
     resp?.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData)?.inlineData?.data;
@@ -128,12 +138,22 @@ export async function generateConversationVideo(opts: {
   let operation: any;
 
   if (useRef) {
-    const { base64, mimeType } = await fetchAsBase64(opts.assistant.avatar!.downloadUrl);
+    // ✅ Preferisci leggere direttamente dallo storage (meno fragile di fetch su URL con token)
+    let base64: string;
+    try {
+      const a = opts.assistant.avatar!;
+      const r = await readStoragePathAsBase64(a.bucket, a.path);
+      base64 = r.base64;
+    } catch {
+      const a = opts.assistant.avatar!;
+      const fetched = await fetchAsBase64(a.downloadUrl);
+      base64 = fetched.base64;
+    }
 
     operation = await ai.models.generateVideos({
       model,
       prompt: opts.prompt,
-      image: { imageBytes: base64, mimeType },
+      image: { imageBytes: base64, mimeType: "image/png" },
       config: { safetySettings }
     });
   } else {
@@ -144,7 +164,11 @@ export async function generateConversationVideo(opts: {
     });
   }
 
+  // Polling operation
+  let tries = 0;
   while (!operation?.done) {
+    tries++;
+    if (tries > 120) throw new Error("VIDEO_GENERATION_TIMEOUT");
     await new Promise((r) => setTimeout(r, 10_000));
     operation = await ai.operations.getVideosOperation({ operation });
   }
@@ -152,10 +176,23 @@ export async function generateConversationVideo(opts: {
   const videoFile = operation?.response?.generatedVideos?.[0]?.video;
   if (!videoFile) throw new Error("VIDEO_GENERATION_FAILED_NO_VIDEO");
 
-  const tmpPath = `/tmp/${newId()}.mp4`;
-  await ai.files.download({ file: videoFile, downloadPath: tmpPath });
+  // ✅ FIX: ai.files.download vuole { file: file.name, downloadPath }
+  const fileName: string | undefined =
+    typeof videoFile === "string" ? videoFile : (videoFile.name as string | undefined);
 
-  const bytes = await import("node:fs/promises").then((fs) => fs.readFile(tmpPath));
+  if (!fileName) throw new Error("VIDEO_GENERATION_FAILED_NO_FILE_NAME");
+
+  const tmpPath = `/tmp/${newId()}.mp4`;
+  await ai.files.download({ file: fileName, downloadPath: tmpPath });
+
+  const fs = await import("node:fs/promises");
+  const bytes = await fs.readFile(tmpPath).finally(async () => {
+    try {
+      await fs.unlink(tmpPath);
+    } catch {
+      // ignore
+    }
+  });
 
   const path = `conversations/${opts.ownerUid}/${opts.conversationId}/videos/${newId()}.mp4`;
   return uploadBytesToStorage({ path, bytes: Buffer.from(bytes), contentType: "video/mp4" });

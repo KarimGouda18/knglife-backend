@@ -12,8 +12,8 @@ export type UploadedFileInfo = {
   downloadUrl: string;
 };
 
-function encodeStoragePath(path: string) {
-  return encodeURIComponent(path).replace(/%2F/g, "%2F");
+function encodePath(path: string) {
+  return encodeURIComponent(path);
 }
 
 export async function uploadBytesToStorage(opts: {
@@ -27,8 +27,11 @@ export async function uploadBytesToStorage(opts: {
   const downloadToken = crypto.randomUUID();
   const file = bucket.file(opts.path);
 
+  // ✅ Per video (e file grossi) evita problemi di upload con resumable=false
+  const useResumable = opts.bytes.length > 5 * 1024 * 1024;
+
   await file.save(opts.bytes, {
-    resumable: false,
+    resumable: useResumable,
     contentType: opts.contentType,
     metadata: {
       metadata: {
@@ -38,7 +41,7 @@ export async function uploadBytesToStorage(opts: {
   });
 
   const downloadUrl =
-    `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encodeURIComponent(opts.path)}` +
+    `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encodePath(opts.path)}` +
     `?alt=media&token=${downloadToken}`;
 
   return {

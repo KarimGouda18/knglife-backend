@@ -28,6 +28,13 @@ const PartsSchema = z.array(
       type: z.literal("inline_data"),
       mimeType: z.string().min(1),
       dataBase64: z.string().min(1)
+    }),
+    // ✅ nuovo: file_url (displayName è opzionale e NON verrà passato a Gemini)
+    z.object({
+      type: z.literal("file_url"),
+      mimeType: z.string().min(1),
+      url: z.string().url(),
+      displayName: z.string().min(1).max(200).optional()
     })
   ])
 );
@@ -135,7 +142,14 @@ apiConversationsRouter.post("/:id/message", async (req, res, next) => {
 
     const userMsg = await addMessage(db, convo.id, {
       role: "user",
-      content: parts.map((p) => (p.type === "text" ? p.text : "")).join(" ").trim(),
+      content: parts
+        .map((p) => {
+          if (p.type === "text") return p.text;
+          if (p.type === "file_url") return `[file:${p.mimeType}]`;
+          return "";
+        })
+        .join(" ")
+        .trim(),
       parts
     });
 
@@ -156,7 +170,9 @@ apiConversationsRouter.post("/:id/message", async (req, res, next) => {
       parts: [{ type: "text", text: reply }]
     });
 
-    return res.status(200).json(sanitizeDeep({ ok: true, userMessage: userMsg, assistantMessage: assistantMsg }));
+    return res
+      .status(200)
+      .json(sanitizeDeep({ ok: true, userMessage: userMsg, assistantMessage: assistantMsg }));
   } catch (err) {
     return next(err);
   }
