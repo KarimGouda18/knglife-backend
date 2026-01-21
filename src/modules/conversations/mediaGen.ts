@@ -6,7 +6,6 @@ import { getGeminiSafetySettings } from "../../shared/utils/safety.js";
 import { uploadBytesToStorage } from "../../shared/utils/storage.js";
 import type { UserProfile } from "../users/userRepo.js";
 import type { AssistantDoc } from "../assistants/assistantsRepo.js";
-import { getStorage } from "../../config/firebase.js";
 
 function newId() {
   return crypto.randomUUID();
@@ -25,16 +24,51 @@ async function fetchAsBase64(url: string): Promise<{ base64: string; mimeType: s
   return { base64: Buffer.from(ab).toString("base64"), mimeType };
 }
 
-async function readStoragePathAsBase64(bucketName: string, objectPath: string): Promise<{ base64: string }> {
-  const bucket = getStorage().bucket(bucketName);
-  const [buf] = await bucket.file(objectPath).download();
-  return { base64: Buffer.from(buf).toString("base64") };
-}
-
 function guessImageExt(mime: string) {
   if (mime.includes("jpeg") || mime.includes("jpg")) return "jpg";
   if (mime.includes("webp")) return "webp";
   return "png";
+}
+
+function extractFilesNameFromUri(uri: string): string | null {
+  // es: https://generativelanguage.googleapis.com/v1beta/files/8bem4xshl3ac:download?alt=media
+  const m = uri.match(/\/v1beta\/(files\/[^:\s\/\?]+)/);
+  return m?.[1] ?? null;
+}
+
+async function downloadGenaiFileToBuffer(opts: {
+  uri?: string;
+  name?: string;
+}): Promise<Buffer> {
+  const ai = getGenAI();
+
+  // 1) se abbiamo name (files/xxxx) usiamo ai.files.download (consigliato)
+  if (opts.name) {
+    const tmpPath = `/tmp/${newId()}.bin`;
+    await ai.files.download({ file: opts.name, downloadPath: tmpPath }); // :contentReference[oaicite:1]{index=1}
+    const fs = await import("node:fs/promises");
+    const bytes = await fs.readFile(tmpPath);
+    try {
+      await fs.unlink(tmpPath);
+    } catch {
+      // ignore
+    }
+    return Buffer.from(bytes);
+  }
+
+  // 2) fallback: fetch diretto della uri (con API key)
+  if (opts.uri) {
+    const res = await fetch(opts.uri, {
+      headers: {
+        "x-goog-api-key": env.GEMINI_API_KEY
+      }
+    });
+    if (!res.ok) throw new Error(`VIDEO_DOWNLOAD_FAILED: ${res.status} ${res.statusText}`);
+    const ab = await res.arrayBuffer();
+    return Buffer.from(ab);
+  }
+
+  throw new Error("VIDEO_GENERATION_FAILED_NO_FILE_NAME");
 }
 
 export async function generateConversationImage(opts: {
@@ -61,21 +95,14 @@ export async function generateConversationImage(opts: {
   let resp: any;
 
   if (useRef) {
-    // ✅ Niente base64: usa fileData con URL (più stabile e coerente col nuovo sistema allegati)
+    const { base64, mimeType } = await fetchAsBase64(opts.assistant.avatar!.downloadUrl);
+
     resp = await ai.models.generateContent({
       model: env.GEMINI_IMAGE_MODEL,
       contents: [
         {
           role: "user",
-          parts: [
-            { text: opts.prompt },
-            {
-              fileData: {
-                fileUri: opts.assistant.avatar!.downloadUrl,
-                mimeType: opts.assistant.avatar!.contentType || "image/png"
-              }
-            }
-          ]
+          parts: [{ text: opts.prompt }, { inlineData: { data: base64, mimeType } }]
         }
       ],
       config: {
@@ -138,22 +165,12 @@ export async function generateConversationVideo(opts: {
   let operation: any;
 
   if (useRef) {
-    // ✅ Preferisci leggere direttamente dallo storage (meno fragile di fetch su URL con token)
-    let base64: string;
-    try {
-      const a = opts.assistant.avatar!;
-      const r = await readStoragePathAsBase64(a.bucket, a.path);
-      base64 = r.base64;
-    } catch {
-      const a = opts.assistant.avatar!;
-      const fetched = await fetchAsBase64(a.downloadUrl);
-      base64 = fetched.base64;
-    }
+    const { base64, mimeType } = await fetchAsBase64(opts.assistant.avatar!.downloadUrl);
 
     operation = await ai.models.generateVideos({
       model,
       prompt: opts.prompt,
-      image: { imageBytes: base64, mimeType: "image/png" },
+      image: { imageBytes: base64, mimeType },
       config: { safetySettings }
     });
   } else {
@@ -164,36 +181,33 @@ export async function generateConversationVideo(opts: {
     });
   }
 
-  // Polling operation
-  let tries = 0;
   while (!operation?.done) {
-    tries++;
-    if (tries > 120) throw new Error("VIDEO_GENERATION_TIMEOUT");
     await new Promise((r) => setTimeout(r, 10_000));
     operation = await ai.operations.getVideosOperation({ operation });
   }
 
-  const videoFile = operation?.response?.generatedVideos?.[0]?.video;
-  if (!videoFile) throw new Error("VIDEO_GENERATION_FAILED_NO_VIDEO");
+  if (operation?.error) {
+    const msg = operation?.error?.message ?? "VIDEO_GENERATION_FAILED_OPERATION_ERROR";
+    throw new Error(msg);
+  }
 
-  // ✅ FIX: ai.files.download vuole { file: file.name, downloadPath }
-  const fileName: string | undefined =
-    typeof videoFile === "string" ? videoFile : (videoFile.name as string | undefined);
+  const generated = operation?.response?.generatedVideos?.[0];
+  const video = generated?.video;
 
-  if (!fileName) throw new Error("VIDEO_GENERATION_FAILED_NO_FILE_NAME");
+  // Forme note:
+  // - { uri: ".../v1beta/files/<id>:download?alt=media", mimeType?, videoBytes? }
+  // - oppure un File con { name: "files/<id>", ... }
+  const uri: string | undefined = video?.uri;
+  const name: string | undefined = video?.name ?? extractFilesNameFromUri(uri ?? "");
 
-  const tmpPath = `/tmp/${newId()}.mp4`;
-  await ai.files.download({ file: fileName, downloadPath: tmpPath });
+  // Se il backend ti logga "VIDEO_GENERATION_FAILED_NO_FILE_NAME" era qui.
+  const bytes =
+    typeof video?.videoBytes === "string" && video.videoBytes.length > 0
+      ? Buffer.from(video.videoBytes, "base64")
+      : await downloadGenaiFileToBuffer({ uri, name });
 
-  const fs = await import("node:fs/promises");
-  const bytes = await fs.readFile(tmpPath).finally(async () => {
-    try {
-      await fs.unlink(tmpPath);
-    } catch {
-      // ignore
-    }
-  });
+  if (!bytes || bytes.length === 0) throw new Error("VIDEO_GENERATION_FAILED_EMPTY_BYTES");
 
   const path = `conversations/${opts.ownerUid}/${opts.conversationId}/videos/${newId()}.mp4`;
-  return uploadBytesToStorage({ path, bytes: Buffer.from(bytes), contentType: "video/mp4" });
+  return uploadBytesToStorage({ path, bytes, contentType: "video/mp4" });
 }

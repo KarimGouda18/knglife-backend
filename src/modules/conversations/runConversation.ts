@@ -7,6 +7,10 @@ import type { MessagePart } from "./conversationsRepo.js";
 import type { UserProfile } from "../users/userRepo.js";
 import type { AssistantDoc } from "../assistants/assistantsRepo.js";
 
+function nowRomeHuman() {
+  return new Date().toLocaleString("it-IT", { timeZone: "Europe/Rome" });
+}
+
 function buildSystemContext(opts: {
   user: Pick<
     UserProfile,
@@ -22,14 +26,12 @@ function buildSystemContext(opts: {
   return [
     `Sei "${opts.assistant.name} ${opts.assistant.surname}".`,
     `Questa è una chat dentro KNGLife.`,
+    `Data e ora correnti (Europe/Rome): ${nowRomeHuman()} (ISO: ${new Date().toISOString()})`,
     `Regole:`,
     `- Rispondi in italiano.`,
     `- Sii coerente con età/genere/relazione dell'assistente.`,
     `- Se l'utente carica allegati, analizzali e rispondi.`,
     `- Se l'utente chiede di aggiungere dati alla bio, NON modificare nulla da solo: proponi una patch testuale e attendi conferma.`,
-    `- Data e ora correnti (Europe/Rome): ${new Date().toLocaleString("it-IT", {
-      timeZone: "Europe/Rome"
-    })} (ISO: ${new Date().toISOString()})`,
     ``,
     `Profili (JSON):`,
     JSON.stringify(payload)
@@ -59,10 +61,8 @@ function mapPartsToGemini(parts: MessagePart[]) {
       };
     }
 
-    // ✅ IMPORTANTISSIMO:
-    // Gemini accetta SOLO { fileData: { fileUri, mimeType } }
-    // e NON accetta displayName dentro fileData.
     if (p.type === "file_url") {
+      // ✅ Gemini NON accetta displayName in fileData/file_data (era il tuo 400)
       return {
         fileData: {
           fileUri: p.url,
@@ -71,7 +71,6 @@ function mapPartsToGemini(parts: MessagePart[]) {
       };
     }
 
-    // exhaustive guard
     return { text: "" };
   });
 }

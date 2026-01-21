@@ -24,7 +24,7 @@ export async function generateConversationTitle(opts: {
     `Genera un TITOLO breve e informativo per una conversazione.`,
     `Regole:`,
     `- Italiano`,
-    `- Massimo 60 caratteri`,
+    `- Massimo 45 caratteri`,
     `- Niente virgolette`,
     `- Niente emoji`,
     `- Deve descrivere l'argomento principale`,
