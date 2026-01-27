@@ -14,7 +14,8 @@ import {
   unpublishAssistant,
   updateAssistant,
   type AssistantDoc,
-  type AssistantPersona
+  type AssistantPersona,
+  type AssistantNudgeSettings
 } from "../../modules/assistants/assistantsRepo.js";
 import { generateAssistantBio } from "../../modules/assistants/generateBio.js";
 import { generateAndUploadAssistantAvatar } from "../../modules/assistants/generateAvatar.js";
@@ -89,6 +90,15 @@ function normalizePersona(p?: Partial<AssistantPersona> | undefined): AssistantP
   return Object.keys(cleaned).length ? (cleaned as AssistantPersona) : null;
 }
 
+function normalizeNudgeSettings(input: any): AssistantNudgeSettings | null {
+  if (!input) return null;
+  const enabled = !!input.enabled;
+  const afterIdleMinutes = Math.max(5, Math.min(60 * 24 * 14, Number(input.afterIdleMinutes ?? 180) || 180)); // 5m..14d
+  const everyMinutes = Math.max(5, Math.min(60 * 24 * 14, Number(input.everyMinutes ?? 360) || 360));
+  const lastNudgeAt = typeof input.lastNudgeAt === "string" ? input.lastNudgeAt : null;
+  return { enabled, afterIdleMinutes, everyMinutes, lastNudgeAt };
+}
+
 apiAssistantsRouter.get("/", async (req, res, next) => {
   try {
     const db = getFirestore();
@@ -115,11 +125,18 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
 
       nsfwEnabled: z.boolean().default(false),
 
-      // ✅ VOCE LIVE ASSISTANT
       voiceName: VoiceNameSchema.optional(),
 
-      // ✅ nuovi campi opzionali (persona)
-      persona: PersonaSchema
+      persona: PersonaSchema,
+
+      // ✅ nudge opzionale
+      nudge: z
+        .object({
+          enabled: z.boolean().default(false),
+          afterIdleMinutes: z.number().int().min(5).max(60 * 24 * 14).default(180),
+          everyMinutes: z.number().int().min(5).max(60 * 24 * 14).default(360)
+        })
+        .optional()
     });
 
     const input = Body.parse(req.body);
@@ -136,8 +153,8 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
 
     const voiceName = (input.voiceName ?? "Kore").trim() || "Kore";
     const persona = normalizePersona(input.persona);
+    const nudge = normalizeNudgeSettings({ ...input.nudge, lastNudgeAt: null });
 
-    // ✅ se manual -> resta quello dell'utente; se auto -> generazione con persona
     let bio = input.bioMode === "manual" ? (input.bio ?? "").trim() : "";
     if (input.bioMode === "auto") {
       bio = await generateAssistantBio({
@@ -193,8 +210,9 @@ apiAssistantsRouter.post("/", async (req, res, next) => {
 
       voiceName,
 
-      // ✅ optional persona
       ...(persona !== undefined ? { persona } : {}),
+
+      ...(nudge ? { nudge } : {}),
 
       isPublic: false,
       publishedAt: null,
@@ -242,7 +260,15 @@ apiAssistantsRouter.put("/:id", async (req, res, next) => {
 
       voiceName: z.string().min(1).max(40).optional(),
 
-      persona: PersonaSchema
+      persona: PersonaSchema,
+
+      nudge: z
+        .object({
+          enabled: z.boolean().optional(),
+          afterIdleMinutes: z.number().int().min(5).max(60 * 24 * 14).optional(),
+          everyMinutes: z.number().int().min(5).max(60 * 24 * 14).optional()
+        })
+        .optional()
     });
 
     const patch = Body.parse(req.body) as any;
@@ -264,12 +290,21 @@ apiAssistantsRouter.put("/:id", async (req, res, next) => {
       patch.voiceName = patch.voiceName.trim() || "Kore";
     }
 
-    // normalizza persona
     if ("persona" in patch) {
       const persona = normalizePersona(patch.persona);
       patch.persona = persona === undefined ? undefined : persona;
-      // se persona è undefined, non vogliamo scrivere undefined in Firestore
       if (patch.persona === undefined) delete patch.persona;
+    }
+
+    if ("nudge" in patch) {
+      const base = existing.nudge ?? { enabled: false, afterIdleMinutes: 180, everyMinutes: 360, lastNudgeAt: null };
+      const merged = normalizeNudgeSettings({
+        enabled: patch.nudge?.enabled ?? base.enabled,
+        afterIdleMinutes: patch.nudge?.afterIdleMinutes ?? base.afterIdleMinutes,
+        everyMinutes: patch.nudge?.everyMinutes ?? base.everyMinutes,
+        lastNudgeAt: base.lastNudgeAt
+      });
+      patch.nudge = merged;
     }
 
     const updated = await updateAssistant(db, req.params.id, patch);
@@ -287,18 +322,14 @@ apiAssistantsRouter.delete("/:id", async (req, res, next) => {
       return res.status(404).json({ ok: false, error: "ASSISTANT_NOT_FOUND" });
     }
 
-    // ✅ Cascade delete: elimina tutte le conversazioni associate (e messaggi)
     const convos = await listOwnerConversationsByAssistant(db, req.user!.uid, existing.id, 200);
     for (const c of convos) {
       await deleteConversationCascade(db, c.id);
     }
 
-    // ✅ elimina memoria assistant (best-effort)
     try {
       await assistantMemoriesCol(db).doc(existing.id).delete();
-    } catch {
-      // ignore
-    }
+    } catch {}
 
     await deleteAssistant(db, req.params.id);
     return res.status(200).json({ ok: true });

@@ -31,13 +31,11 @@ function guessImageExt(mime: string) {
 }
 
 function extractFilesNameFromUri(uri: string): string | null {
-  // es: https://generativelanguage.googleapis.com/v1beta/files/8bem4xshl3ac:download?alt=media
   const m = uri.match(/\/v1beta\/(files\/[^:\s\/\?]+)/);
   return m?.[1] ?? null;
 }
 
 async function fetchVideoByUri(uri: string): Promise<Buffer> {
-  // Fallback robusto: scarica direttamente la URI con API key
   const res = await fetch(uri, {
     headers: { "x-goog-api-key": env.GEMINI_API_KEY }
   });
@@ -50,47 +48,57 @@ async function downloadGenaiFileToBuffer(opts: { uri?: string; name?: string }):
   const ai = getGenAI();
   const fs = await import("node:fs/promises");
 
-  // 1) Se ho name (files/xxxx), provo ai.files.download -> tmp -> readFile
   if (opts.name) {
     const tmpPath = `/tmp/${newId()}.bin`;
     try {
       await ai.files.download({ file: opts.name, downloadPath: tmpPath });
 
-      // ✅ Cloud Run / ambienti strani: verifica esistenza prima di readFile
       await fs.access(tmpPath);
       const bytes = await fs.readFile(tmpPath);
       try {
         await fs.unlink(tmpPath);
-      } catch {
-        // ignore
-      }
+      } catch {}
 
       if (!bytes || bytes.length === 0) {
-        // se è vuoto, fallback fetch
         if (opts.uri) return await fetchVideoByUri(opts.uri);
         throw new Error("VIDEO_DOWNLOAD_FAILED_EMPTY_FILE");
       }
 
       return Buffer.from(bytes);
     } catch (e: any) {
-      // ✅ Se download non crea il file (ENOENT) o fallisce: fallback su fetch(uri)
       try {
-        // pulizia best-effort
         await fs.unlink(tmpPath);
-      } catch {
-        // ignore
-      }
+      } catch {}
       if (opts.uri) return await fetchVideoByUri(opts.uri);
       throw new Error(`VIDEO_DOWNLOAD_FAILED_GENAI: ${e?.message ?? String(e)}`);
     }
   }
 
-  // 2) Se non ho name, provo direttamente fetch(uri)
   if (opts.uri) {
     return await fetchVideoByUri(opts.uri);
   }
 
   throw new Error("VIDEO_GENERATION_FAILED_NO_FILE_NAME");
+}
+
+function clampDurationSeconds(s: number) {
+  const n = Math.floor(Number(s));
+  if (!Number.isFinite(n) || n <= 0) return 8;
+  // Veo base: 8s. Extension: +7s fino a 20 volte => max 148s.
+  if (n < 4) return 4;
+  if (n > 148) return 148;
+  return n;
+}
+
+function requiredExtensionHops(targetSeconds: number) {
+  if (targetSeconds <= 8) return 0;
+  return Math.min(20, Math.ceil((targetSeconds - 8) / 7));
+}
+
+function continuationPrompt(basePrompt: string, hopIndex: number, totalHops: number) {
+  const p = String(basePrompt ?? "").trim();
+  const extra = `Continua la stessa scena in modo coerente (estensione ${hopIndex}/${totalHops}), mantenendo personaggi, ambiente, stile e audio coerenti.`;
+  return p ? `${p}\n\n${extra}` : extra;
 }
 
 export async function generateConversationImage(opts: {
@@ -170,6 +178,9 @@ export async function generateConversationVideo(opts: {
   assistant: Pick<AssistantDoc, "nsfwEnabled" | "avatar">;
 
   useAssistantAvatar?: boolean;
+
+  // ✅ durata desiderata (secondi). Se > 8, usa estensioni Veo (+7s per hop, max 20) :contentReference[oaicite:1]{index=1}
+  durationSeconds?: number;
 }) {
   const ai = getGenAI();
 
@@ -181,11 +192,17 @@ export async function generateConversationVideo(opts: {
 
   const model = normalizeVeoModelName(env.VEO_VIDEO_MODEL);
 
+  const targetSeconds = opts.durationSeconds ? clampDurationSeconds(opts.durationSeconds) : 8;
+  const hops = requiredExtensionHops(targetSeconds);
+
+  // estensione richiede 720p :contentReference[oaicite:2]{index=2}
+  const baseResolution = hops > 0 ? "720p" : undefined;
+
   const hasAvatar = !!opts.assistant.avatar?.downloadUrl;
   const useRef = !!opts.useAssistantAvatar && hasAvatar;
 
+  // 1) Generazione base
   let operation: any;
-
   if (useRef) {
     const { base64, mimeType } = await fetchAsBase64(opts.assistant.avatar!.downloadUrl);
 
@@ -193,13 +210,13 @@ export async function generateConversationVideo(opts: {
       model,
       prompt: opts.prompt,
       image: { imageBytes: base64, mimeType },
-      config: { safetySettings }
+      config: { safetySettings, ...(baseResolution ? { resolution: baseResolution } : {}) }
     });
   } else {
     operation = await ai.models.generateVideos({
       model,
       prompt: opts.prompt,
-      config: { safetySettings }
+      config: { safetySettings, ...(baseResolution ? { resolution: baseResolution } : {}) }
     });
   }
 
@@ -213,8 +230,35 @@ export async function generateConversationVideo(opts: {
     throw new Error(msg);
   }
 
-  const generated = operation?.response?.generatedVideos?.[0];
-  const video = generated?.video;
+  // 2) Estensioni (se richieste)
+  let currentVideo = operation?.response?.generatedVideos?.[0]?.video;
+  if (!currentVideo) throw new Error("VIDEO_GENERATION_FAILED_NO_VIDEO_REF");
+
+  for (let i = 1; i <= hops; i++) {
+    let extOp = await ai.models.generateVideos({
+      model,
+      // L’API estende passando il video precedente come input :contentReference[oaicite:3]{index=3}
+      video: currentVideo,
+      prompt: continuationPrompt(opts.prompt, i, hops),
+      config: { safetySettings, resolution: "720p", numberOfVideos: 1 }
+    });
+
+    while (!extOp?.done) {
+      await new Promise((r) => setTimeout(r, 10_000));
+      extOp = await ai.operations.getVideosOperation({ operation: extOp });
+    }
+
+    if (extOp?.error) {
+      const msg = extOp?.error?.message ?? "VIDEO_EXTENSION_FAILED_OPERATION_ERROR";
+      throw new Error(msg);
+    }
+
+    currentVideo = extOp?.response?.generatedVideos?.[0]?.video;
+    if (!currentVideo) throw new Error("VIDEO_EXTENSION_FAILED_NO_VIDEO_REF");
+    operation = extOp;
+  }
+
+  const video = operation?.response?.generatedVideos?.[0]?.video;
 
   const uri: string | undefined = video?.uri;
   const name: string | undefined = video?.name ?? (uri ? extractFilesNameFromUri(uri) ?? undefined : undefined);

@@ -18,10 +18,17 @@ function buildSystemContext(opts: {
   >;
   assistant: Pick<
     AssistantDoc,
-    "name" | "surname" | "age" | "gender" | "relationship" | "bio" | "nsfwEnabled" | "avatarSpec"
+    "id" | "name" | "surname" | "age" | "gender" | "relationship" | "bio" | "nsfwEnabled" | "avatarSpec" | "persona"
   >;
+  assistantMemory: string;
+  recallText: string;
+  conversationSummary: string | null;
 }) {
   const payload = { user: opts.user, assistant: opts.assistant };
+
+  const mem = (opts.assistantMemory ?? "").trim();
+  const recall = (opts.recallText ?? "").trim();
+  const summary = (opts.conversationSummary ?? "").trim();
 
   return [
     `Sei "${opts.assistant.name} ${opts.assistant.surname}".`,
@@ -31,8 +38,17 @@ function buildSystemContext(opts: {
     `- Rispondi in italiano.`,
     `- Sii coerente con età/genere/relazione dell'assistente.`,
     `- Se l'utente carica allegati, analizzali e rispondi.`,
-    `- Se NON riesci a leggere un allegato (es. PDF non accessibile), devi dirlo chiaramente e spiegare cosa ti serve.`,
+    `- Se NON riesci a leggere un allegato, devi dirlo chiaramente e spiegare cosa ti serve.`,
     `- Non restituire mai una risposta vuota.`,
+    ``,
+    `MEMORIA A LUNGO TERMINE (assistente):`,
+    mem || "(vuota)",
+    ``,
+    `RIASSUNTO CONVERSAZIONE CORRENTE:`,
+    summary || "(vuoto)",
+    ``,
+    `RICHIAMI DA CONVERSAZIONI PRECEDENTI (se utili):`,
+    recall || "(nessuno)",
     ``,
     `Profili (JSON):`,
     JSON.stringify(payload)
@@ -89,6 +105,9 @@ export async function runConversation(opts: {
   history: { role: "user" | "assistant"; parts: MessagePart[] }[];
   userProfile: UserProfile;
   assistant: AssistantDoc;
+  assistantMemory: string;
+  recallText: string;
+  conversationSummary: string | null;
 }): Promise<string> {
   const ai = getGenAI();
 
@@ -110,6 +129,7 @@ export async function runConversation(opts: {
       nsfwEnabled: opts.userProfile.nsfwEnabled
     },
     assistant: {
+      id: opts.assistant.id,
       name: opts.assistant.name,
       surname: opts.assistant.surname,
       age: opts.assistant.age,
@@ -117,8 +137,12 @@ export async function runConversation(opts: {
       relationship: opts.assistant.relationship,
       bio: opts.assistant.bio,
       nsfwEnabled: opts.assistant.nsfwEnabled,
-      avatarSpec: opts.assistant.avatarSpec
-    }
+      avatarSpec: opts.assistant.avatarSpec,
+      persona: opts.assistant.persona ?? null
+    },
+    assistantMemory: opts.assistantMemory,
+    recallText: opts.recallText,
+    conversationSummary: opts.conversationSummary
   });
 
   const contents = [
@@ -142,7 +166,6 @@ export async function runConversation(opts: {
   const cleaned = sanitizeForJson(raw).trim();
 
   if (!cleaned) {
-    // ✅ Non salvare mai risposta vuota: rendi l’errore debuggabile
     const finishReason = resp?.candidates?.[0]?.finishReason ?? null;
     const promptFeedback = resp?.promptFeedback ?? null;
     const safetyRatings = resp?.candidates?.[0]?.safetyRatings ?? null;

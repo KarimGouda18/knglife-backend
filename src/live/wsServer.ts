@@ -11,22 +11,34 @@ import { getOrCreateUserProfile } from "../modules/users/userRepo.js";
 import { getAssistant } from "../modules/assistants/assistantsRepo.js";
 import { buildAssistantLiveSystemPrompt, buildInterviewLiveSystemPrompt } from "./prompts.js";
 import { addInterviewMessage, createInterview, getInterview } from "../modules/interview/interviewRepo.js";
+import {
+  addMessage,
+  createConversation,
+  getConversation,
+  updateConversation,
+  newId,
+  type ConversationDoc
+} from "../modules/conversations/conversationsRepo.js";
+import { buildAssistantRecallContext } from "../modules/conversations/recall.js";
+import { updateConversationSummary } from "../modules/conversations/updateSummary.js";
+import { generateConversationTitle } from "../modules/conversations/generateTitle.js";
+import { upsertAssistantMemory } from "../modules/assistants/assistantMemory.js";
 
 /**
  * Protocollo WS (client -> server):
- * - { type: "input_audio", dataBase64: string, mimeType?: string }    // default: audio/pcm;rate=16000
- * - { type: "input_video", dataBase64: string, mimeType?: string }    // tipico: image/jpeg (frame)
- * - { type: "input_text", text: string }                              // opzionale (debug)
- * - { type: "end_turn" }                                              // forza flush
+ * - { type: "input_audio", dataBase64: string, mimeType?: string }
+ * - { type: "input_video", dataBase64: string, mimeType?: string }
+ * - { type: "input_text", text: string }
+ * - { type: "end_turn" }
  * - { type: "close" }
  *
- * Compatibilità extra (per non rompere client diversi):
+ * Compatibilità extra:
  * - { type: "audio", dataBase64: string, mimeType?: string }
  * - { type: "video", dataBase64: string, mimeType?: string }
- * - { type: "realtime_input", audio?: { dataBase64: string, mimeType?: string }, video?: { dataBase64: string, mimeType?: string } }
+ * - { type: "realtime_input", audio?: {...}, video?: {...} }
  *
  * Server -> client:
- * - { type: "ready", session: {...}, interviewId?: string }
+ * - { type: "ready", session: {...}, interviewId?: string, conversationId?: string }
  * - { type: "output_audio", dataBase64: string, mimeType: string }
  * - { type: "output_transcription", text: string }
  * - { type: "input_transcription", text: string }
@@ -236,9 +248,200 @@ class TranscriptSaver {
   }
 }
 
+class LiveConversationSaver {
+  private readonly db: ReturnType<typeof getFirestore>;
+  private readonly ownerUid: string;
+  private readonly assistant: any;
+  private readonly userProfile: any;
+
+  private convo: ConversationDoc;
+
+  private userBuf = "";
+  private assistantBuf = "";
+
+  private userTimer: NodeJS.Timeout | null = null;
+  private assistantTimer: NodeJS.Timeout | null = null;
+
+  private readonly FLUSH_MS = 900;
+  private readonly MIN_LEN = 8;
+  private readonly MAX_BUF = 2400;
+
+  private pendingUserText: string | null = null;
+
+  private assistantMemory: string;
+  private recallText: string;
+
+  constructor(opts: {
+    db: ReturnType<typeof getFirestore>;
+    ownerUid: string;
+    assistant: any;
+    userProfile: any;
+    conversation: ConversationDoc;
+    assistantMemory: string;
+    recallText: string;
+  }) {
+    this.db = opts.db;
+    this.ownerUid = opts.ownerUid;
+    this.assistant = opts.assistant;
+    this.userProfile = opts.userProfile;
+    this.convo = opts.conversation;
+    this.assistantMemory = opts.assistantMemory;
+    this.recallText = opts.recallText;
+  }
+
+  private mergeIncremental(prev: string, next: string) {
+    const p = normalizeSpaces(prev);
+    const n = normalizeSpaces(next);
+
+    if (!p) return n;
+    if (!n) return p;
+
+    if (n.startsWith(p)) return n;
+    if (p.startsWith(n)) return p;
+
+    return normalizeSpaces(`${p} ${n}`);
+  }
+
+  private shouldSave(text: string) {
+    const t = normalizeSpaces(text);
+    if (!t) return false;
+    if (t.length < this.MIN_LEN) return false;
+    return true;
+  }
+
+  private scheduleFlush(role: "user" | "assistant") {
+    const old = role === "user" ? this.userTimer : this.assistantTimer;
+    if (old) clearTimeout(old);
+
+    const timer = setTimeout(() => {
+      void this.flush(role);
+    }, this.FLUSH_MS);
+
+    if (role === "user") this.userTimer = timer;
+    else this.assistantTimer = timer;
+  }
+
+  appendUserChunk(chunk: string) {
+    const c = normalizeSpaces(chunk);
+    if (!c) return;
+    this.userBuf = this.mergeIncremental(this.userBuf, c);
+    if (this.userBuf.length >= this.MAX_BUF) void this.flush("user");
+    else this.scheduleFlush("user");
+  }
+
+  appendAssistantChunk(chunk: string) {
+    const c = normalizeSpaces(chunk);
+    if (!c) return;
+    this.assistantBuf = this.mergeIncremental(this.assistantBuf, c);
+    if (this.assistantBuf.length >= this.MAX_BUF) void this.flush("assistant");
+    else this.scheduleFlush("assistant");
+  }
+
+  async flush(role: "user" | "assistant") {
+    if (role === "user") {
+      if (this.userTimer) clearTimeout(this.userTimer);
+      this.userTimer = null;
+
+      const text = normalizeSpaces(this.userBuf);
+      this.userBuf = "";
+
+      if (!this.shouldSave(text)) return;
+
+      await addMessage(this.db, this.convo.id, {
+        role: "user",
+        content: text,
+        parts: [{ type: "text", text }]
+      });
+
+      this.pendingUserText = text;
+      return;
+    }
+
+    if (this.assistantTimer) clearTimeout(this.assistantTimer);
+    this.assistantTimer = null;
+
+    const text = normalizeSpaces(this.assistantBuf);
+    this.assistantBuf = "";
+
+    if (!this.shouldSave(text)) return;
+
+    await addMessage(this.db, this.convo.id, {
+      role: "assistant",
+      content: text,
+      parts: [{ type: "text", text }]
+    });
+
+    const lastUserText = this.pendingUserText ?? "(audio)";
+    this.pendingUserText = null;
+
+    // titolo se mancante e primo scambio (se la convo è senza titolo e non ha summary)
+    const titleMissing = !this.convo.title || !this.convo.title.trim();
+    const isFirstExchange = !this.convo.summary;
+
+    const tasks: Promise<any>[] = [];
+
+    tasks.push(
+      (async () => {
+        const nextSummary = await updateConversationSummary({
+          user: { birthDate: this.userProfile.birthDate, nsfwEnabled: this.userProfile.nsfwEnabled },
+          assistant: { nsfwEnabled: !!this.assistant.nsfwEnabled },
+          previousSummary: this.convo.summary ?? null,
+          lastUserText,
+          lastAssistantText: text
+        });
+        const updated = await updateConversation(this.db, this.convo.id, { summary: nextSummary });
+        if (updated) this.convo = updated;
+      })()
+    );
+
+    if (titleMissing && isFirstExchange) {
+      tasks.push(
+        (async () => {
+          const t = await generateConversationTitle({
+            user: { birthDate: this.userProfile.birthDate, nsfwEnabled: this.userProfile.nsfwEnabled },
+            assistant: { nsfwEnabled: !!this.assistant.nsfwEnabled },
+            firstUserText: lastUserText,
+            firstAssistantText: text
+          });
+          const updated = await updateConversation(this.db, this.convo.id, { title: t });
+          if (updated) this.convo = updated;
+        })()
+      );
+    }
+
+    tasks.push(
+      (async () => {
+        const nextMem = await upsertAssistantMemory({
+          db: this.db,
+          ownerUid: this.ownerUid,
+          assistant: {
+            id: this.assistant.id,
+            name: this.assistant.name,
+            surname: this.assistant.surname,
+            nsfwEnabled: !!this.assistant.nsfwEnabled,
+            relationship: this.assistant.relationship
+          },
+          user: { birthDate: this.userProfile.birthDate, nsfwEnabled: this.userProfile.nsfwEnabled },
+          currentMemory: this.assistantMemory,
+          newConversationDelta: `Utente (live): ${lastUserText}\nAssistente (live): ${text}`
+        });
+        this.assistantMemory = nextMem;
+      })()
+    );
+
+    await Promise.allSettled(tasks);
+  }
+
+  async flushAll() {
+    await Promise.allSettled([this.flush("user"), this.flush("assistant")]);
+  }
+
+  getConversationId() {
+    return this.convo.id;
+  }
+}
+
 async function sendRealtimeVideoFrame(session: any, opts: { dataBase64: string; mimeType: string }) {
-  // Il doc parla di realtimeInput.video come blob/stream (concetto: frame come immagine) :contentReference[oaicite:2]{index=2}
-  // Nel JS SDK la shape può variare tra versioni: proviamo "video", poi fallback "mediaChunks".
   const data = normalizeInlineBase64(opts.dataBase64);
   const mimeType = opts.mimeType || "image/jpeg";
 
@@ -249,7 +452,6 @@ async function sendRealtimeVideoFrame(session: any, opts: { dataBase64: string; 
     return;
   } catch {}
 
-  // fallback legacy/deprecato ma spesso compatibile
   try {
     await session.sendRealtimeInput({
       mediaChunks: [{ data, mimeType }]
@@ -315,6 +517,9 @@ export function attachLiveWebSocketServer(server: http.Server) {
       let interviewNsfwEnabled = false;
       let transcriptSaver: TranscriptSaver | null = null;
 
+      let conversationId: string | null = null;
+      let liveSaver: LiveConversationSaver | null = null;
+
       if (isInterview) {
         const requestedInterviewId = url.searchParams.get("interviewId");
 
@@ -376,6 +581,35 @@ export function attachLiveWebSocketServer(server: http.Server) {
         const voiceFromQuery = url.searchParams.get("voiceName");
         voiceName = (voiceFromQuery || pickVoiceName(assistant)).trim() || "Kore";
 
+        // conversationId opzionale: se non c'è, creiamo una nuova conversazione live
+        const requestedConversationId = url.searchParams.get("conversationId");
+        if (requestedConversationId) {
+          const existing = await getConversation(db, requestedConversationId);
+          if (existing && existing.ownerUid === authUser.uid && existing.assistantId === assistant.id) {
+            conversationId = existing.id;
+          }
+        }
+
+        if (!conversationId) {
+          const created = await createConversation(db, {
+            id: newId(),
+            ownerUid: authUser.uid,
+            assistantId: assistant.id,
+            title: null,
+            summary: null,
+            nsfwEnabled: assistant.nsfwEnabled
+          });
+          conversationId = created.id;
+        }
+
+        const convo = (await getConversation(db, conversationId))!;
+        const { assistantMemory, recallText } = await buildAssistantRecallContext({
+          db,
+          ownerUid: authUser.uid,
+          assistantId: assistant.id,
+          excludeConversationId: convo.id
+        });
+
         systemPrompt = buildAssistantLiveSystemPrompt({
           user: {
             name: userProfile.name,
@@ -388,6 +622,7 @@ export function attachLiveWebSocketServer(server: http.Server) {
             nsfwEnabled: userProfile.nsfwEnabled
           },
           assistant: {
+            id: assistant.id,
             name: assistant.name,
             surname: assistant.surname,
             age: assistant.age,
@@ -395,8 +630,22 @@ export function attachLiveWebSocketServer(server: http.Server) {
             relationship: assistant.relationship,
             bio: assistant.bio,
             nsfwEnabled: assistant.nsfwEnabled,
-            avatarSpec: assistant.avatarSpec
-          }
+            avatarSpec: assistant.avatarSpec,
+            persona: assistant.persona ?? null
+          },
+          assistantMemory,
+          recallText,
+          conversationSummary: convo.summary ?? null
+        });
+
+        liveSaver = new LiveConversationSaver({
+          db,
+          ownerUid: authUser.uid,
+          assistant,
+          userProfile,
+          conversation: convo,
+          assistantMemory,
+          recallText
         });
       }
 
@@ -406,7 +655,6 @@ export function attachLiveWebSocketServer(server: http.Server) {
         assistantNsfwEnabled: isInterview ? interviewNsfwEnabled : (assistant?.nsfwEnabled ?? false)
       });
 
-      // ✅ Grounding Google Search su Live: tools in config :contentReference[oaicite:3]{index=3}
       const tools = [{ googleSearch: {} }];
 
       const session = await ai.live.connect({
@@ -434,11 +682,13 @@ export function attachLiveWebSocketServer(server: http.Server) {
             wsSend(ws, {
               type: "ready",
               interviewId: interviewId ?? undefined,
+              conversationId: liveSaver?.getConversationId() ?? conversationId ?? undefined,
               session: {
                 mode: isInterview ? "interview" : "assistant",
                 voiceName: isInterview ? undefined : voiceName,
                 model: env.GEMINI_REALTIME_MODEL,
                 interviewId: interviewId ?? undefined,
+                conversationId: liveSaver?.getConversationId() ?? conversationId ?? undefined,
                 tools: ["googleSearch"]
               }
             });
@@ -459,18 +709,32 @@ export function attachLiveWebSocketServer(server: http.Server) {
 
             if (sig.inputTranscription) {
               wsSend(ws, { type: "input_transcription", text: sig.inputTranscription });
+
               if (isInterview && transcriptSaver) {
                 try {
                   transcriptSaver.appendUserChunk(sig.inputTranscription);
+                } catch {}
+              }
+
+              if (!isInterview && liveSaver) {
+                try {
+                  liveSaver.appendUserChunk(sig.inputTranscription);
                 } catch {}
               }
             }
 
             if (sig.outputTranscription) {
               wsSend(ws, { type: "output_transcription", text: sig.outputTranscription });
+
               if (isInterview && transcriptSaver) {
                 try {
                   transcriptSaver.appendAssistantChunk(sig.outputTranscription);
+                } catch {}
+              }
+
+              if (!isInterview && liveSaver) {
+                try {
+                  liveSaver.appendAssistantChunk(sig.outputTranscription);
                 } catch {}
               }
             }
@@ -491,6 +755,9 @@ export function attachLiveWebSocketServer(server: http.Server) {
               if (isInterview && transcriptSaver) await transcriptSaver.flushAll();
             } catch {}
             try {
+              if (!isInterview && liveSaver) await liveSaver.flushAll();
+            } catch {}
+            try {
               ws.close(1000, "Live session closed");
             } catch {}
           }
@@ -503,7 +770,6 @@ export function attachLiveWebSocketServer(server: http.Server) {
         if (!msg || typeof msg.type !== "string") return;
 
         try {
-          // === AUDIO (varianti compatibili) ===
           if (msg.type === "input_audio" || msg.type === "audio") {
             const mimeType = msg.mimeType || "audio/pcm;rate=16000";
             const data = normalizeInlineBase64(msg.dataBase64);
@@ -516,7 +782,6 @@ export function attachLiveWebSocketServer(server: http.Server) {
             return;
           }
 
-          // === VIDEO FRAME (camera/screen) ===
           if (msg.type === "input_video" || msg.type === "video") {
             const mimeType = msg.mimeType || "image/jpeg";
             await sendRealtimeVideoFrame(session, { dataBase64: msg.dataBase64, mimeType });
@@ -538,7 +803,6 @@ export function attachLiveWebSocketServer(server: http.Server) {
             return;
           }
 
-          // === TESTO (debug) ===
           if (msg.type === "input_text") {
             await session.sendClientContent({
               turns: [{ role: "user", parts: [{ text: msg.text }] }],
@@ -547,21 +811,24 @@ export function attachLiveWebSocketServer(server: http.Server) {
             return;
           }
 
-          // === END TURN ===
           if (msg.type === "end_turn") {
-            if (isInterview && transcriptSaver) {
-              try {
-                await transcriptSaver.flushAll();
-              } catch {}
-            }
+            try {
+              if (isInterview && transcriptSaver) await transcriptSaver.flushAll();
+            } catch {}
+            try {
+              if (!isInterview && liveSaver) await liveSaver.flushAll();
+            } catch {}
+
             await session.sendClientContent({ turns: [], turnComplete: true });
             return;
           }
 
-          // === CLOSE ===
           if (msg.type === "close") {
             try {
               if (isInterview && transcriptSaver) await transcriptSaver.flushAll();
+            } catch {}
+            try {
+              if (!isInterview && liveSaver) await liveSaver.flushAll();
             } catch {}
             try {
               session.close();
@@ -582,6 +849,9 @@ export function attachLiveWebSocketServer(server: http.Server) {
 
         try {
           if (isInterview && transcriptSaver) await transcriptSaver.flushAll();
+        } catch {}
+        try {
+          if (!isInterview && liveSaver) await liveSaver.flushAll();
         } catch {}
 
         try {

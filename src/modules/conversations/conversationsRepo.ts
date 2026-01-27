@@ -52,6 +52,13 @@ export async function getConversation(db: Firestore, id: string) {
   return snap.data() as ConversationDoc;
 }
 
+export async function updateConversation(db: Firestore, id: string, patch: Partial<ConversationDoc>) {
+  const ref = conversationsCol(db).doc(id);
+  await ref.set({ ...patch, updatedAt: nowIso() }, { merge: true });
+  const snap = await ref.get();
+  return snap.exists ? (snap.data() as ConversationDoc) : null;
+}
+
 export async function listOwnerConversations(db: Firestore, ownerUid: string, limit = 30) {
   const q = await conversationsCol(db)
     .where("ownerUid", "==", ownerUid)
@@ -82,6 +89,17 @@ export async function listOwnerConversationsByAssistant(
   return q.docs.map((d) => d.data() as ConversationDoc);
 }
 
+export async function getLatestConversationByAssistant(db: Firestore, ownerUid: string, assistantId: string) {
+  const q = await conversationsCol(db)
+    .where("ownerUid", "==", ownerUid)
+    .where("assistantId", "==", assistantId)
+    .orderBy("updatedAt", "desc")
+    .limit(1)
+    .get();
+
+  return q.empty ? null : (q.docs[0]!.data() as ConversationDoc);
+}
+
 export async function deleteConversation(db: Firestore, id: string) {
   await conversationsCol(db).doc(id).delete();
 }
@@ -109,11 +127,9 @@ export async function listMessages(db: Firestore, conversationId: string, limit 
 export async function deleteConversationCascade(db: Firestore, conversationId: string) {
   const convoRef = conversationsCol(db).doc(conversationId);
 
-  // Cancella messages a chunk
   const col = convoRef.collection("messages");
   const chunkSize = 200;
 
-  // loop finché ci sono docs
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const snap = await col.orderBy("createdAt", "asc").limit(chunkSize).get();
@@ -123,10 +139,8 @@ export async function deleteConversationCascade(db: Firestore, conversationId: s
     snap.docs.forEach((d) => batch.delete(d.ref));
     await batch.commit();
 
-    // Se abbiamo letto meno del chunkSize, era l’ultimo giro
     if (snap.size < chunkSize) break;
   }
 
-  // Poi cancella la conversazione
   await convoRef.delete();
 }

@@ -1,7 +1,10 @@
 // src/live/prompts.ts
 import type { AssistantDoc } from "../modules/assistants/assistantsRepo.js";
 import type { UserProfile } from "../modules/users/userRepo.js";
-import { buildInterviewSystemInstruction } from "../modules/interview/interviewPrompts.js";
+
+function normalizeSpaces(s: string) {
+  return String(s ?? "").replace(/\s+/g, " ").trim();
+}
 
 export function buildAssistantLiveSystemPrompt(opts: {
   user: Pick<
@@ -10,24 +13,36 @@ export function buildAssistantLiveSystemPrompt(opts: {
   >;
   assistant: Pick<
     AssistantDoc,
-    "name" | "surname" | "age" | "gender" | "relationship" | "bio" | "nsfwEnabled" | "avatarSpec"
+    "id" | "name" | "surname" | "age" | "gender" | "relationship" | "bio" | "nsfwEnabled" | "avatarSpec" | "persona"
   >;
+  assistantMemory: string;
+  recallText: string;
+  conversationSummary: string | null;
 }) {
-  const payload = { user: opts.user, assistant: opts.assistant };
+  const mem = normalizeSpaces(opts.assistantMemory || "");
+  const recall = (opts.recallText || "").trim();
+  const sum = normalizeSpaces(opts.conversationSummary || "");
 
   return [
-    `Sei l'assistente "${opts.assistant.name} ${opts.assistant.surname}".`,
-    `Questa è una chiamata Live (audio) dentro KNGLife.`,
-    ``,
+    `Sei "${opts.assistant.name} ${opts.assistant.surname}".`,
+    `Sei in una sessione VOCALE (Live) di KNGLife.`,
     `Regole:`,
-    `- Parla e rispondi in italiano.`,
-    `- Sii coerente con età/genere/relazione dell'assistente.`,
-    `- Mantieni un tono naturale da conversazione reale.`,
-    `- Se l'utente chiede di aggiungere dati alla bio, NON modificare nulla da solo: proponi una patch testuale e chiedi conferma.`,
-    `- Evita di leggere ad alta voce JSON o dettagli tecnici. Usa il contesto internamente.`,
+    `- Parla in italiano.`,
+    `- Risposte concise, naturali, utili.`,
+    `- Coerenza con relazione/età/genere e profilo assistente.`,
+    `- Non fare l'assistente “vuoto”: se non capisci chiedi chiarimenti.`,
+    ``,
+    `MEMORIA A LUNGO TERMINE (assistente):`,
+    mem || "(vuota)",
+    ``,
+    `RIASSUNTO CONVERSAZIONE CORRENTE:`,
+    sum || "(vuoto)",
+    ``,
+    `RICHIAMI DA CONVERSAZIONI PRECEDENTI (se utili):`,
+    recall || "(nessuno)",
     ``,
     `Profili (JSON):`,
-    JSON.stringify(payload)
+    JSON.stringify({ user: opts.user, assistant: opts.assistant })
   ].join("\n");
 }
 
@@ -39,10 +54,18 @@ export function buildInterviewLiveSystemPrompt(opts: {
   interviewNsfwEnabled: boolean;
   allowExplicit: boolean;
 }) {
-  // ✅ Stesso identico “system” della interview testuale
-  return buildInterviewSystemInstruction({
-    user: opts.user,
-    interviewNsfwEnabled: opts.interviewNsfwEnabled,
-    allowExplicit: opts.allowExplicit
-  });
+  return [
+    `Sei un'intervistatrice per l'onboarding di KNGLife.`,
+    `Obiettivo: fare domande una alla volta, raccogliere info utili per costruire un profilo.`,
+    `Regole:`,
+    `- Italiano`,
+    `- Una domanda per volta`,
+    `- Se l'utente risponde in modo vago, chiedi chiarimenti`,
+    `- Mantieni il ritmo: breve, chiaro, accessibile`,
+    `- NSFW consentito per l'intervista: ${opts.interviewNsfwEnabled ? "SI" : "NO"}`,
+    `- Allow explicit (safety): ${opts.allowExplicit ? "SI" : "NO"}`,
+    ``,
+    `Profilo utente (JSON):`,
+    JSON.stringify(opts.user)
+  ].join("\n");
 }

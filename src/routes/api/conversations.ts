@@ -13,20 +13,24 @@ import {
   getConversation,
   listMessages,
   listOwnerConversations,
-  newId
+  newId,
+  updateConversation
 } from "../../modules/conversations/conversationsRepo.js";
 import { runConversation } from "../../modules/conversations/runConversation.js";
 import { sanitizeDeep } from "../../shared/utils/sanitizeDeep.js";
 import { generateConversationImage, generateConversationVideo } from "../../modules/conversations/mediaGen.js";
 import { uploadBytesToStorage } from "../../shared/utils/storage.js";
+import { buildAssistantRecallContext } from "../../modules/conversations/recall.js";
+import { generateConversationTitle } from "../../modules/conversations/generateTitle.js";
+import { updateConversationSummary } from "../../modules/conversations/updateSummary.js";
+import { upsertAssistantMemory } from "../../modules/assistants/assistantMemory.js";
 
 export const apiConversationsRouter = Router();
 apiConversationsRouter.use(requireAuth);
 
-// Upload (PDF/TXT/whatever) -> Storage -> ritorna downloadUrl da usare come file_url
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 } // 25MB (Cloud Run-friendly)
+  limits: { fileSize: 25 * 1024 * 1024 }
 });
 
 const PartsSchema = z.array(
@@ -71,11 +75,14 @@ apiConversationsRouter.post("/", async (req, res, next) => {
       return res.status(404).json({ ok: false, error: "ASSISTANT_NOT_FOUND" });
     }
 
+    const normalizedTitle = typeof title === "string" && title.trim() ? title.trim() : null;
+
     const convo = await createConversation(db, {
       id: newId(),
       ownerUid: req.user!.uid,
       assistantId,
-      title: title ?? null,
+      title: normalizedTitle,
+      summary: null,
       nsfwEnabled: assistant.nsfwEnabled
     });
 
@@ -128,10 +135,6 @@ apiConversationsRouter.get("/:id/messages", async (req, res, next) => {
   }
 });
 
-/**
- * POST /api/conversations/:id/upload
- * multipart/form-data field: file
- */
 apiConversationsRouter.post("/:id/upload", upload.single("file"), async (req, res, next) => {
   try {
     const db = getFirestore();
@@ -187,16 +190,18 @@ apiConversationsRouter.post("/:id/message", async (req, res, next) => {
 
     const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
 
+    const userMsgText = parts
+      .map((p) => {
+        if (p.type === "text") return p.text;
+        if (p.type === "file_url") return `[file:${p.mimeType}]`;
+        return "";
+      })
+      .join(" ")
+      .trim();
+
     const userMsg = await addMessage(db, convo.id, {
       role: "user",
-      content: parts
-        .map((p) => {
-          if (p.type === "text") return p.text;
-          if (p.type === "file_url") return `[file:${p.mimeType}]`;
-          return "";
-        })
-        .join(" ")
-        .trim(),
+      content: userMsgText,
       parts
     });
 
@@ -205,10 +210,21 @@ apiConversationsRouter.post("/:id/message", async (req, res, next) => {
       .filter((m) => m.role === "user" || m.role === "assistant")
       .map((m) => ({ role: m.role as "user" | "assistant", parts: m.parts }));
 
+    // ✅ recall + memoria assistente
+    const { assistantMemory, recallText } = await buildAssistantRecallContext({
+      db,
+      ownerUid: req.user!.uid,
+      assistantId: assistant.id,
+      excludeConversationId: convo.id
+    });
+
     const reply = await runConversation({
       history,
       userProfile,
-      assistant
+      assistant,
+      assistantMemory,
+      recallText,
+      conversationSummary: convo.summary ?? null
     });
 
     const assistantMsg = await addMessage(db, convo.id, {
@@ -217,16 +233,68 @@ apiConversationsRouter.post("/:id/message", async (req, res, next) => {
       parts: [{ type: "text", text: reply }]
     });
 
+    // ✅ 1) titolo se mancante (solo primo scambio)
+    const titleMissing = !convo.title || !convo.title.trim();
+    const firstTurn = history.length === 1; // dopo userMsg, prima della reply, la history contiene solo quel turno user
+    // ✅ 2) summary sempre
+    // ✅ 3) memoria autonoma sempre
+    const tasks: Promise<any>[] = [];
+
+    tasks.push(
+      (async () => {
+        const nextSummary = await updateConversationSummary({
+          user: { birthDate: userProfile.birthDate, nsfwEnabled: userProfile.nsfwEnabled },
+          assistant: { nsfwEnabled: assistant.nsfwEnabled },
+          previousSummary: convo.summary ?? null,
+          lastUserText: userMsgText,
+          lastAssistantText: reply
+        });
+        await updateConversation(db, convo.id, { summary: nextSummary });
+      })()
+    );
+
+    if (titleMissing && firstTurn) {
+      tasks.push(
+        (async () => {
+          const genTitle = await generateConversationTitle({
+            user: { birthDate: userProfile.birthDate, nsfwEnabled: userProfile.nsfwEnabled },
+            assistant: { nsfwEnabled: assistant.nsfwEnabled },
+            firstUserText: userMsgText,
+            firstAssistantText: reply
+          });
+          await updateConversation(db, convo.id, { title: genTitle });
+        })()
+      );
+    }
+
+    tasks.push(
+      (async () => {
+        await upsertAssistantMemory({
+          db,
+          ownerUid: req.user!.uid,
+          assistant: {
+            id: assistant.id,
+            name: assistant.name,
+            surname: assistant.surname,
+            nsfwEnabled: assistant.nsfwEnabled,
+            relationship: assistant.relationship
+          },
+          user: { birthDate: userProfile.birthDate, nsfwEnabled: userProfile.nsfwEnabled },
+          currentMemory: assistantMemory,
+          newConversationDelta: `Utente: ${userMsgText}\nAssistente: ${reply}`
+        });
+      })()
+    );
+
+    // best-effort, ma lo facciamo davvero (se fallisce non blocca la chat)
+    await Promise.allSettled(tasks);
+
     return res.status(200).json(sanitizeDeep({ ok: true, userMessage: userMsg, assistantMessage: assistantMsg }));
   } catch (err) {
     return next(err);
   }
 });
 
-/**
- * POST /api/conversations/:id/generate/image
- * Body: { prompt: string, useAssistantAvatar?: boolean }
- */
 apiConversationsRouter.post("/:id/generate/image", async (req, res, next) => {
   try {
     const Body = z.object({
@@ -270,17 +338,14 @@ apiConversationsRouter.post("/:id/generate/image", async (req, res, next) => {
   }
 });
 
-/**
- * POST /api/conversations/:id/generate/video
- * Body: { prompt: string, useAssistantAvatar?: boolean }
- */
 apiConversationsRouter.post("/:id/generate/video", async (req, res, next) => {
   try {
     const Body = z.object({
       prompt: z.string().min(1).max(4000),
-      useAssistantAvatar: z.boolean().optional()
+      useAssistantAvatar: z.boolean().optional(),
+      durationSeconds: z.number().int().min(4).max(148).optional()
     });
-    const { prompt, useAssistantAvatar } = Body.parse(req.body);
+    const { prompt, useAssistantAvatar, durationSeconds } = Body.parse(req.body);
 
     const db = getFirestore();
 
@@ -300,6 +365,7 @@ apiConversationsRouter.post("/:id/generate/video", async (req, res, next) => {
       ownerUid: req.user!.uid,
       conversationId: convo.id,
       prompt,
+      durationSeconds,
       useAssistantAvatar: !!useAssistantAvatar,
       user: { birthDate: userProfile.birthDate, nsfwEnabled: userProfile.nsfwEnabled },
       assistant: { nsfwEnabled: assistant.nsfwEnabled, avatar: assistant.avatar }

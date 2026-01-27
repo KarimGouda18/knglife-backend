@@ -21,20 +21,26 @@ export type AssistantAvatar = {
 };
 
 export type AssistantPersona = {
-  // ✅ Tutti opzionali, tutte stringhe (come richiesto)
-  personality?: string | null; // tratti/temperamento
-  profession?: string | null; // lavoro/studi
-  identityType?: string | null; // "reale", "fictional", "original", "celebrity", ecc (stringa libera)
-  sourceMaterial?: string | null; // opera/contesto se fictional o ispirato
+  personality?: string | null;
+  profession?: string | null;
+  identityType?: string | null;
+  sourceMaterial?: string | null;
   backstory?: string | null;
   traits?: string | null;
   interests?: string | null;
   values?: string | null;
-  speakingStyle?: string | null; // tono/registro/lessico
+  speakingStyle?: string | null;
   goals?: string | null;
   familyNotes?: string | null;
   location?: string | null;
   otherNotes?: string | null;
+};
+
+export type AssistantNudgeSettings = {
+  enabled: boolean;
+  afterIdleMinutes: number; // se inattiva da X minuti
+  everyMinutes: number; // non più spesso di ogni Y minuti
+  lastNudgeAt: string | null;
 };
 
 export type AssistantDoc = {
@@ -56,16 +62,16 @@ export type AssistantDoc = {
 
   nsfwEnabled: boolean;
 
-  // ✅ Live voice per ASSISTANT (non interview)
   voiceName: string;
 
-  // ✅ Nuovi campi per persona/backstory (opzionali)
   persona?: AssistantPersona | null;
+
+  // ✅ Messaggi estemporanei (per-assistente)
+  nudge?: AssistantNudgeSettings | null;
 
   isPublic: boolean;
   publishedAt: string | null;
 
-  // ✅ Metadati clone (opzionali, non rompono nulla)
   clonedFromAssistantId?: string | null;
   clonedFromOwnerUid?: string | null;
   clonedAt?: string | null;

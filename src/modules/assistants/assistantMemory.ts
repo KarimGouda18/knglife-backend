@@ -10,7 +10,7 @@ import type { AssistantDoc } from "./assistantsRepo.js";
 export type AssistantMemoryDoc = {
   assistantId: string;
   ownerUid: string;
-  memory: string; // sintesi “stabile” che cresce nel tempo
+  memory: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -36,7 +36,7 @@ export async function upsertAssistantMemory(opts: {
   assistant: Pick<AssistantDoc, "id" | "name" | "surname" | "nsfwEnabled" | "relationship">;
   user: Pick<UserProfile, "birthDate" | "nsfwEnabled">;
   currentMemory: string;
-  newConversationDelta: string; // mini riassunto o estratto dello scambio
+  newConversationDelta: string;
 }): Promise<string> {
   const ai = getGenAI();
 
@@ -52,7 +52,7 @@ export async function upsertAssistantMemory(opts: {
     `Regole:`,
     `- Scrivi in italiano.`,
     `- Salva solo informazioni STABILI e utili per conversazioni future (preferenze, fatti ricorrenti, confini, progetti).`,
-    `- Evita dettagli temporanei, numeri casuali, o cose “usa e getta”.`,
+    `- Evita dettagli temporanei o "usa e getta".`,
     `- Se l'informazione è incerta, NON inserirla come fatto.`,
     `- Formato: elenco puntato breve (max 1200 caratteri).`,
     ``,
