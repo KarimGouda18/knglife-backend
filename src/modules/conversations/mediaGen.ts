@@ -6,6 +6,9 @@ import { getGeminiSafetySettings } from "../../shared/utils/safety.js";
 import { uploadBytesToStorage } from "../../shared/utils/storage.js";
 import type { UserProfile } from "../users/userRepo.js";
 import type { AssistantDoc } from "../assistants/assistantsRepo.js";
+import { spawn } from "node:child_process";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 
 function newId() {
   return crypto.randomUUID();
@@ -46,7 +49,6 @@ async function fetchVideoByUri(uri: string): Promise<Buffer> {
 
 async function downloadGenaiFileToBuffer(opts: { uri?: string; name?: string }): Promise<Buffer> {
   const ai = getGenAI();
-  const fs = await import("node:fs/promises");
 
   if (opts.name) {
     const tmpPath = `/tmp/${newId()}.bin`;
@@ -84,7 +86,6 @@ async function downloadGenaiFileToBuffer(opts: { uri?: string; name?: string }):
 function clampDurationSeconds(s: number) {
   const n = Math.floor(Number(s));
   if (!Number.isFinite(n) || n <= 0) return 8;
-  // Veo base: 8s. Extension: +7s fino a 20 volte => max 148s.
   if (n < 4) return 4;
   if (n > 148) return 148;
   return n;
@@ -99,6 +100,91 @@ function continuationPrompt(basePrompt: string, hopIndex: number, totalHops: num
   const p = String(basePrompt ?? "").trim();
   const extra = `Continua la stessa scena in modo coerente (estensione ${hopIndex}/${totalHops}), mantenendo personaggi, ambiente, stile e audio coerenti.`;
   return p ? `${p}\n\n${extra}` : extra;
+}
+
+/**
+ * Concatena più video MP4 usando FFmpeg.
+ * IMPORTANTE: I video devono avere stesso codec/risoluzione per concat funzionare bene.
+ */
+async function concatenateVideos(videoBuffers: Buffer[]): Promise<Buffer> {
+  if (videoBuffers.length === 0) {
+    throw new Error("CONCATENATE_VIDEOS_NO_VIDEOS");
+  }
+
+  if (videoBuffers.length === 1) {
+    // Nessuna concatenazione necessaria
+    return videoBuffers[0];
+  }
+
+  const tmpDir = `/tmp/video-concat-${newId()}`;
+  await fs.mkdir(tmpDir, { recursive: true });
+
+  try {
+    // Scrivi tutti i video in file temporanei
+    const inputFiles: string[] = [];
+    for (let i = 0; i < videoBuffers.length; i++) {
+      const inputPath = path.join(tmpDir, `input_${i}.mp4`);
+      await fs.writeFile(inputPath, videoBuffers[i]);
+      inputFiles.push(inputPath);
+    }
+
+    // Crea il file list per FFmpeg concat demuxer
+    const listPath = path.join(tmpDir, "list.txt");
+    const listContent = inputFiles.map(f => `file '${f}'`).join("\n");
+    await fs.writeFile(listPath, listContent);
+
+    // Output path
+    const outputPath = path.join(tmpDir, "output.mp4");
+
+    console.log(`🎬 Concatenating ${videoBuffers.length} videos with FFmpeg...`);
+
+    // Esegui FFmpeg
+    await new Promise<void>((resolve, reject) => {
+      const ffmpeg = spawn("ffmpeg", [
+        "-f", "concat",
+        "-safe", "0",
+        "-i", listPath,
+        "-c", "copy", // Copy codec (fast, no re-encoding)
+        outputPath
+      ]);
+
+      let stderr = "";
+
+      ffmpeg.stderr.on("data", (data) => {
+        stderr += data.toString();
+      });
+
+      ffmpeg.on("close", (code) => {
+        if (code !== 0) {
+          console.error("FFmpeg stderr:", stderr);
+          reject(new Error(`FFMPEG_CONCAT_FAILED: exit code ${code}`));
+        } else {
+          console.log(`✅ FFmpeg concatenation completed`);
+          resolve();
+        }
+      });
+
+      ffmpeg.on("error", (err) => {
+        reject(new Error(`FFMPEG_SPAWN_ERROR: ${err.message}`));
+      });
+    });
+
+    // Leggi il file output
+    const outputBuffer = await fs.readFile(outputPath);
+
+    // Cleanup
+    await fs.rm(tmpDir, { recursive: true, force: true });
+
+    console.log(`✅ Concatenated video: ${outputBuffer.length} bytes`);
+    return outputBuffer;
+
+  } catch (error) {
+    // Cleanup in caso di errore
+    try {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    } catch {}
+    throw error;
+  }
 }
 
 export async function generateConversationImage(opts: {
@@ -179,7 +265,6 @@ export async function generateConversationVideo(opts: {
 
   useAssistantAvatar?: boolean;
 
-  // ✅ durata desiderata (secondi). Se > 8, usa estensioni Veo (+7s per hop, max 20) :contentReference[oaicite:1]{index=1}
   durationSeconds?: number;
 }) {
   const ai = getGenAI();
@@ -195,14 +280,24 @@ export async function generateConversationVideo(opts: {
   const targetSeconds = opts.durationSeconds ? clampDurationSeconds(opts.durationSeconds) : 8;
   const hops = requiredExtensionHops(targetSeconds);
 
-  // estensione richiede 720p :contentReference[oaicite:2]{index=2}
-  const baseResolution = hops > 0 ? "720p" : undefined;
+  console.log(`🎬 Video generation: target=${targetSeconds}s, hops=${hops}`);
 
   const hasAvatar = !!opts.assistant.avatar?.downloadUrl;
   const useRef = !!opts.useAssistantAvatar && hasAvatar;
 
-  // 1) Generazione base
+  const baseConfig: any = {
+    safetySettings,
+    numberOfVideos: 1
+  };
+
+  // Array per raccogliere tutti i video buffers
+  const videoBuffers: Buffer[] = [];
+
+  // 1️⃣ Generazione base (8 secondi)
+  console.log(`🎬 Step 1/${hops + 1}: Generating base video (8s)...`);
+
   let operation: any;
+
   if (useRef) {
     const { base64, mimeType } = await fetchAsBase64(opts.assistant.avatar!.downloadUrl);
 
@@ -210,16 +305,17 @@ export async function generateConversationVideo(opts: {
       model,
       prompt: opts.prompt,
       image: { imageBytes: base64, mimeType },
-      config: { safetySettings, ...(baseResolution ? { resolution: baseResolution } : {}) }
+      config: baseConfig
     });
   } else {
     operation = await ai.models.generateVideos({
       model,
       prompt: opts.prompt,
-      config: { safetySettings, ...(baseResolution ? { resolution: baseResolution } : {}) }
+      config: baseConfig
     });
   }
 
+  // Poll base video
   while (!operation?.done) {
     await new Promise((r) => setTimeout(r, 10_000));
     operation = await ai.operations.getVideosOperation({ operation });
@@ -230,46 +326,99 @@ export async function generateConversationVideo(opts: {
     throw new Error(msg);
   }
 
-  // 2) Estensioni (se richieste)
-  let currentVideo = operation?.response?.generatedVideos?.[0]?.video;
-  if (!currentVideo) throw new Error("VIDEO_GENERATION_FAILED_NO_VIDEO_REF");
+  let currentVideoRef = operation?.response?.generatedVideos?.[0]?.video;
+  if (!currentVideoRef) {
+    throw new Error("VIDEO_GENERATION_FAILED_NO_VIDEO_REF");
+  }
+
+  console.log(`✅ Base video generated`);
+
+  // ✅ SCARICA il video base
+  const baseVideoUri = currentVideoRef?.uri;
+  const baseVideoName = currentVideoRef?.name ?? (baseVideoUri ? extractFilesNameFromUri(baseVideoUri) ?? undefined : undefined);
+
+  console.log(`🎬 Downloading base video: uri=${baseVideoUri}, name=${baseVideoName}`);
+
+  const baseVideoBytes =
+    typeof currentVideoRef?.videoBytes === "string" && currentVideoRef.videoBytes.length > 0
+      ? Buffer.from(currentVideoRef.videoBytes, "base64")
+      : await downloadGenaiFileToBuffer({ uri: baseVideoUri, name: baseVideoName });
+
+  videoBuffers.push(baseVideoBytes);
+  console.log(`✅ Base video downloaded: ${baseVideoBytes.length} bytes`);
+
+  // 2️⃣ Estensioni (se richieste)
+  if (hops > 0) {
+    console.log(`🎬 Starting ${hops} extension(s)...`);
+  }
 
   for (let i = 1; i <= hops; i++) {
+    console.log(`🎬 Step ${i + 1}/${hops + 1}: Extension ${i}/${hops} (+7s)...`);
+
+    const extConfig: any = {
+      safetySettings,
+      numberOfVideos: 1
+    };
+
     let extOp = await ai.models.generateVideos({
       model,
-      // L’API estende passando il video precedente come input :contentReference[oaicite:3]{index=3}
-      video: currentVideo,
+      video: currentVideoRef, // Riferimento video precedente
       prompt: continuationPrompt(opts.prompt, i, hops),
-      config: { safetySettings, resolution: "720p", numberOfVideos: 1 }
+      config: extConfig
     });
 
+    // Poll estensione
     while (!extOp?.done) {
       await new Promise((r) => setTimeout(r, 10_000));
       extOp = await ai.operations.getVideosOperation({ operation: extOp });
     }
 
     if (extOp?.error) {
-      const msg = extOp?.error?.message ?? "VIDEO_EXTENSION_FAILED_OPERATION_ERROR";
+      const msg = extOp?.error?.message ?? `VIDEO_EXTENSION_${i}_FAILED: ${extOp?.error?.message}`;
       throw new Error(msg);
     }
 
-    currentVideo = extOp?.response?.generatedVideos?.[0]?.video;
-    if (!currentVideo) throw new Error("VIDEO_EXTENSION_FAILED_NO_VIDEO_REF");
-    operation = extOp;
+    currentVideoRef = extOp?.response?.generatedVideos?.[0]?.video;
+    if (!currentVideoRef) {
+      throw new Error(`VIDEO_EXTENSION_${i}_FAILED_NO_VIDEO_REF`);
+    }
+
+    console.log(`✅ Extension ${i}/${hops} generated`);
+
+    // ✅ SCARICA OGNI estensione
+    const extVideoUri = currentVideoRef?.uri;
+    const extVideoName = currentVideoRef?.name ?? (extVideoUri ? extractFilesNameFromUri(extVideoUri) ?? undefined : undefined);
+
+    console.log(`🎬 Downloading extension ${i}: uri=${extVideoUri}, name=${extVideoName}`);
+
+    const extVideoBytes =
+      typeof currentVideoRef?.videoBytes === "string" && currentVideoRef.videoBytes.length > 0
+        ? Buffer.from(currentVideoRef.videoBytes, "base64")
+        : await downloadGenaiFileToBuffer({ uri: extVideoUri, name: extVideoName });
+
+    videoBuffers.push(extVideoBytes);
+    console.log(`✅ Extension ${i} downloaded: ${extVideoBytes.length} bytes`);
   }
 
-  const video = operation?.response?.generatedVideos?.[0]?.video;
+  console.log(`🎬 All videos downloaded (${videoBuffers.length} clips). Concatenating...`);
 
-  const uri: string | undefined = video?.uri;
-  const name: string | undefined = video?.name ?? (uri ? extractFilesNameFromUri(uri) ?? undefined : undefined);
+  // 3️⃣ Concatena tutti i video
+  const finalVideoBytes = await concatenateVideos(videoBuffers);
 
-  const bytes =
-    typeof video?.videoBytes === "string" && video.videoBytes.length > 0
-      ? Buffer.from(video.videoBytes, "base64")
-      : await downloadGenaiFileToBuffer({ uri, name });
+  console.log(`✅ Final concatenated video: ${finalVideoBytes.length} bytes`);
 
-  if (!bytes || bytes.length === 0) throw new Error("VIDEO_GENERATION_FAILED_EMPTY_BYTES");
+  // 4️⃣ Upload su Firebase Storage
+  const storagePath = `conversations/${opts.ownerUid}/${opts.conversationId}/videos/${newId()}.mp4`;
 
-  const path = `conversations/${opts.ownerUid}/${opts.conversationId}/videos/${newId()}.mp4`;
-  return uploadBytesToStorage({ path, bytes, contentType: "video/mp4" });
+  console.log(`🎬 Uploading to storage: ${storagePath}`);
+
+  const uploaded = await uploadBytesToStorage({
+    path: storagePath,
+    bytes: finalVideoBytes,
+    contentType: "video/mp4"
+  });
+
+  console.log(`✅ Video generation complete! Duration: ~${targetSeconds}s`);
+
+  return uploaded;
 }
