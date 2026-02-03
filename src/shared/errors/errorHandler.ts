@@ -64,24 +64,12 @@ export const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
         ? err.status
         : 500;
 
-  // ✅ In produzione: risposta minimal
-  if (isProd()) {
-    return res.status(status).json({
-      ok: false,
-      error: status === 404 ? "NOT_FOUND" : "INTERNAL_SERVER_ERROR"
-    });
-  }
-
-  // ✅ In dev: risposta con dettagli utili per debugging
   return res.status(status).json({
     ok: false,
-    error: status === 404 ? "NOT_FOUND" : "INTERNAL_SERVER_ERROR",
-    debug: {
-      status,
-      code,
-      message: safeString(message),
-      stack: pickErrorStack(err),
-      details: pickErrorDetails(err)
-    }
+    error: status === 404 ? "NOT_FOUND" : safeString(message),
+    status,
+    code,
+    stack: pickErrorStack(err),
+    details: pickErrorDetails(err)
   });
 };

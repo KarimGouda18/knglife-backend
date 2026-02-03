@@ -1,0 +1,199 @@
+// src/routes/api/nudges.ts
+import { Router } from "express";
+import { z } from "zod";
+import { requireAuth } from "../../shared/middleware/requireAuth.js";
+import { getFirestore } from "../../config/firebase.js";
+import { getAssistant, updateAssistant } from "../../modules/assistants/assistantsRepo.js";
+import { getOrCreateUserProfile } from "../../modules/users/userRepo.js";
+import { getLatestConversationByAssistant, addMessage, updateConversation } from "../../modules/conversations/conversationsRepo.js";
+import { buildAssistantRecallContext } from "../../modules/conversations/recall.js";
+import { upsertAssistantMemory } from "../../modules/assistants/assistantMemory.js";
+import { updateConversationSummary } from "../../modules/conversations/updateSummary.js";
+import { env } from "../../config/env.js";
+import { getGenAI } from "../../config/genai.js";
+import { getGeminiSafetySettings } from "../../shared/utils/safety.js";
+import { sanitizeForJson } from "../../shared/utils/text.js";
+import { sanitizeDeep } from "../../shared/utils/sanitizeDeep.js";
+/**
+ * Messaggi estemporanei:
+ * - Config per assistente: PUT /api/nudges/assistants/:id
+ * - Tick (da Cloud Scheduler): POST /api/nudges/tick con header x-cron-token
+ *
+ * Nota: su Cloud Run i "timer in-process" non sono affidabili; il tick va schedulato esternamente.
+ */
+export const apiNudgesRouter = Router();
+apiNudgesRouter.put("/assistants/:id", requireAuth, async (req, res, next) => {
+    try {
+        const Body = z.object({
+            enabled: z.boolean(),
+            afterIdleMinutes: z.number().int().min(5).max(60 * 24 * 14),
+            everyMinutes: z.number().int().min(5).max(60 * 24 * 14)
+        });
+        const input = Body.parse(req.body);
+        const db = getFirestore();
+        const a = await getAssistant(db, req.params.id);
+        if (!a || a.ownerUid !== req.user.uid)
+            return res.status(404).json({ ok: false, error: "ASSISTANT_NOT_FOUND" });
+        const nudge = {
+            enabled: input.enabled,
+            afterIdleMinutes: input.afterIdleMinutes,
+            everyMinutes: input.everyMinutes,
+            lastNudgeAt: a.nudge?.lastNudgeAt ?? null
+        };
+        const updated = await updateAssistant(db, a.id, { nudge });
+        return res.status(200).json(sanitizeDeep({ ok: true, assistant: updated }));
+    }
+    catch (err) {
+        return next(err);
+    }
+});
+apiNudgesRouter.post("/tick", async (req, res, next) => {
+    try {
+        const cronToken = process.env.CRON_TOKEN || "";
+        if (!cronToken) {
+            return res.status(501).json({ ok: false, error: "CRON_TOKEN_NOT_CONFIGURED" });
+        }
+        const got = String(req.headers["x-cron-token"] ?? "");
+        if (got !== cronToken) {
+            return res.status(403).json({ ok: false, error: "FORBIDDEN" });
+        }
+        const db = getFirestore();
+        // ✅ FIX: invece di query con where (che richiede indice), prendiamo tutti gli assistants
+        // e filtriamo in memoria quelli con nudge.enabled == true
+        // Questo è più semplice e non richiede indici Firestore
+        // Ottieni tutti gli owner unici (o limita a un subset ragionevole)
+        // Per ora usiamo un approccio pragmatico: cicliamo su tutti gli assistants
+        // In produzione, potresti voler mantenere una lista di owner attivi in una collection separata
+        const allAssistantsSnap = await db.collection("assistants").limit(500).get();
+        const allAssistants = allAssistantsSnap.docs.map((d) => d.data());
+        // ✅ Filtra in memoria gli assistants con nudge abilitato
+        const assistantsWithNudge = allAssistants.filter((a) => a.nudge?.enabled === true);
+        let processed = 0;
+        let sent = 0;
+        const errors = [];
+        for (const a of assistantsWithNudge) {
+            try {
+                processed++;
+                const n = a.nudge;
+                if (!n?.enabled)
+                    continue;
+                const ownerUid = a.ownerUid;
+                const assistantId = a.id;
+                // ultima conversazione con quell'assistente
+                const convo = await getLatestConversationByAssistant(db, ownerUid, assistantId);
+                if (!convo)
+                    continue;
+                const now = Date.now();
+                const convoUpdatedAt = Date.parse(convo.updatedAt || convo.createdAt);
+                const idleMs = now - convoUpdatedAt;
+                // ✅ Verifica tempo di inattività
+                const afterIdleMs = Number(n.afterIdleMinutes) * 60_000;
+                if (!(idleMs >= afterIdleMs))
+                    continue;
+                // ✅ Verifica frequenza minima tra nudges
+                const lastNudgeAt = n.lastNudgeAt ? Date.parse(n.lastNudgeAt) : 0;
+                const everyMs = Number(n.everyMinutes) * 60_000;
+                if (lastNudgeAt && now - lastNudgeAt < everyMs)
+                    continue;
+                // genera un messaggio breve, non invadente, usando memoria + recall
+                const userProfile = await getOrCreateUserProfile(db, ownerUid, null);
+                const { assistantMemory, recallText } = await buildAssistantRecallContext({
+                    db,
+                    ownerUid,
+                    assistantId,
+                    excludeConversationId: convo.id
+                });
+                const ai = getGenAI();
+                const safetySettings = getGeminiSafetySettings({
+                    userBirthDate: userProfile.birthDate,
+                    userNsfwEnabled: userProfile.nsfwEnabled,
+                    assistantNsfwEnabled: !!a.nsfwEnabled
+                });
+                const prompt = [
+                    `Sei un assistente in KNGLife. Vuoi inviare un messaggio estemporaneo (nudge) all'utente.`,
+                    `Vincoli:`,
+                    `- Italiano`,
+                    `- 1-2 frasi (max 220 caratteri)`,
+                    `- tono umano, caldo, NON pressante`,
+                    `- niente emoji`,
+                    `- proponi un piccolo spunto coerente con memoria/recall`,
+                    ``,
+                    `Memoria assistente:`,
+                    assistantMemory?.trim() || "(vuota)",
+                    ``,
+                    `Richiami conversazioni precedenti:`,
+                    recallText?.trim() || "(nessuno)",
+                    ``,
+                    `Riassunto conversazione corrente:`,
+                    (convo.summary ?? "").trim() || "(vuoto)",
+                    ``,
+                    `Output: solo il messaggio`
+                ].join("\n");
+                const resp = await ai.models.generateContent({
+                    model: env.GEMINI_TEXT_MODEL,
+                    contents: prompt,
+                    config: { safetySettings }
+                });
+                const raw = resp.candidates?.[0]?.content?.parts
+                    ?.map((pp) => pp.text)
+                    .filter(Boolean)
+                    .join("") ?? "";
+                const text = sanitizeForJson(raw).trim();
+                if (!text)
+                    continue;
+                // ✅ Aggiungi messaggio alla conversazione
+                await addMessage(db, convo.id, {
+                    role: "assistant",
+                    content: text,
+                    parts: [{ type: "text", text }]
+                });
+                // ✅ Aggiorna summary in parallelo (best effort)
+                try {
+                    const nextSummary = await updateConversationSummary({
+                        user: { birthDate: userProfile.birthDate, nsfwEnabled: userProfile.nsfwEnabled },
+                        assistant: { nsfwEnabled: !!a.nsfwEnabled },
+                        previousSummary: convo.summary ?? null,
+                        lastUserText: "(nudge automatico)",
+                        lastAssistantText: text
+                    });
+                    await updateConversation(db, convo.id, { summary: nextSummary });
+                }
+                catch (e) {
+                    console.error(`Failed to update summary for conversation ${convo.id}:`, e);
+                }
+                // ✅ Aggiorna memoria in parallelo (best effort)
+                try {
+                    await upsertAssistantMemory({
+                        db,
+                        ownerUid,
+                        assistant: {
+                            id: assistantId,
+                            name: a.name,
+                            surname: a.surname,
+                            nsfwEnabled: !!a.nsfwEnabled,
+                            relationship: a.relationship
+                        },
+                        user: { birthDate: userProfile.birthDate, nsfwEnabled: userProfile.nsfwEnabled },
+                        currentMemory: assistantMemory,
+                        newConversationDelta: `Assistente (nudge): ${text}`
+                    });
+                }
+                catch (e) {
+                    console.error(`Failed to update memory for assistant ${assistantId}:`, e);
+                }
+                // ✅ Segna lastNudgeAt
+                await updateAssistant(db, assistantId, { nudge: { ...n, lastNudgeAt: new Date().toISOString() } });
+                sent++;
+            }
+            catch (e) {
+                const errMsg = `Assistant ${a.id}: ${e?.message ?? String(e)}`;
+                errors.push(errMsg);
+                console.error(`Nudge error for assistant ${a.id}:`, e);
+            }
+        }
+        return res.status(200).json(sanitizeDeep({ ok: true, processed, sent, errors: errors.length > 0 ? errors : undefined }));
+    }
+    catch (err) {
+        return next(err);
+    }
+});
