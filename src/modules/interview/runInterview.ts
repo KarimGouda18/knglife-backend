@@ -74,7 +74,12 @@ export async function generateNextInterviewQuestion(opts: {
   const resp = await ai.models.generateContent({
     model: env.GEMINI_TEXT_MODEL,
     contents: prompt,
-    config: { safetySettings }
+    config: {
+      safetySettings,
+      thinkingConfig: {
+        thinkingLevel: "minimal",
+      }
+    }
   });
 
   const raw =
