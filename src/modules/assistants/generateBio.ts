@@ -13,7 +13,7 @@ export async function generateAssistantBio(opts: {
   >;
   user: Pick<
     UserProfile,
-    "name" | "surname" | "gender" | "visualDisabilityLevel" | "birthDate" | "age" | "nsfwEnabled"
+    "name" | "surname" | "gender" | "visualDisabilityLevel" | "birthDate" | "age" | "nsfwEnabled" | "bio"
   >;
 }): Promise<string> {
   const ai = getGenAI();
@@ -30,7 +30,6 @@ export async function generateAssistantBio(opts: {
     ? [
         "La bio può includere dettagli intimi, desideri espliciti e specifici, coerenti con la relazione con l’utente.",
         "Includi questi dettagli in modo naturale e realistico nel background dell'assistente.",
-        "Non ti preoccupare del linguaggio e non aver paura a usare termini espliciti se coerenti con la relazione.",
         "Questo non deve sostituire interessi o passioni: è un'aggiunta a cui dedicare spazio alla fine della bio."
       ].join(" ")
     : "";
@@ -40,7 +39,7 @@ export async function generateAssistantBio(opts: {
   const prompt = [
     `Scrivi una BIO realistica (background/persona) per un assistente AI che rappresenta una persona vera.`,
     `Lingua: italiano.`,
-    `Stile: concreto, credibile, non generico, massimo 3000 caratteri.`,
+    `Stile: concreto, credibile, realistico.`,
     `L'assistente deve avere vita propria: background, interessi, passioni, lavoro/studio, hobby, relazioni sociali.`,
     `Ogni personaggio ha una famiglia coerente con la sua storia e con la sua relazione con l'utente; parlane brevemente.`,
     `Se nel contesto utente è presente una disabilità visiva, non cambiare la bio includendo frasi o menzioni che ne facciano esplicito riferimento.`,
@@ -49,11 +48,12 @@ export async function generateAssistantBio(opts: {
     ``,
     `Contesto utente:`,
     `- Nome: ${opts.user.name} ${opts.user.surname}`,
+    `- Bio: ${opts.user.bio}`,
     `- Età: ${opts.user.age ?? "n/d"}`,
     `- Genere: ${opts.user.gender ?? "n/d"}`,
     `- Disabilità visiva: ${opts.user.visualDisabilityLevel}`,
     `- NSFW profilo: ${opts.user.nsfwEnabled ? "ON" : "OFF"}`,
-    ``,
+    `Non includere dettagli relativi alla bio dell'utente nel personaggio dell'assistente se non trovi richieste specifiche nei campi persona dell'assistente per cui la devi scrivere e, anche in questo caso, solo se l'assistente ha una relazione molto stretta con l'utente che giustifica la presenza di tali dettagli. Se non ti trovi nella situazione di dover includere la bio, usala come contesto per rifinire personalità, tono e dettagli del carattere dell'assistente.`,
     `Dati assistente (base):`,
     `- Nome: ${opts.assistant.name} ${opts.assistant.surname}`,
     `- Età: ${opts.assistant.age}`,
@@ -76,7 +76,6 @@ export async function generateAssistantBio(opts: {
     `- Luogo/ambientazione: ${p?.location ?? "n/d"}`,
     `- Altre note: ${p?.otherNotes ?? "n/d"}`,
     ``,
-    `Regola: non fare mai riferimento all'utente nella bio; i dati utente servono solo per adattare il tono.`,
     `Devi parlare come se il personaggio si rivolgesse a un pubblico generico, quasi come se scrivesse un articolo.`,
     nsfwInstruction,
     ``,

@@ -10,7 +10,7 @@ import type { AssistantDoc } from "../assistants/assistantsRepo.js";
 import type { GroupDoc } from "./groupsRepo.js";
 
 /**
- * IMPORTANT FIX (per il tuo bug):
+ * IMPORTANT FIX (per il bug):
  * In chat di gruppo NON possiamo inviare i messaggi degli altri assistenti con role="model"
  * (o "assistant") perché Gemini li interpreta come "sue" risposte precedenti e può comportarsi
  * in modo imprevedibile (tra cui risposte vuote / nessun testo al turno successivo).
@@ -38,15 +38,30 @@ function normalizeInlineBase64(input: string) {
   return input.trim();
 }
 
-function mapInlineParts(parts: MessagePart[]) {
+// ✅ Rinominato e aggiunto supporto file_url
+function mapPartsToGemini(parts: MessagePart[]) {
   return parts.map((p) => {
     if (p.type === "text") return { text: p.text };
-    return {
-      inlineData: {
-        mimeType: p.mimeType,
-        data: normalizeInlineBase64(p.dataBase64)
-      }
-    };
+    
+    if (p.type === "inline_data") {
+      return {
+        inlineData: {
+          mimeType: p.mimeType,
+          data: normalizeInlineBase64(p.dataBase64)
+        }
+      };
+    }
+
+    if (p.type === "file_url") {
+      return {
+        fileData: {
+          fileUri: p.url,
+          mimeType: p.mimeType
+        }
+      };
+    }
+
+    return { text: "" };
   });
 }
 
@@ -137,9 +152,10 @@ function buildGroupSystemContext(opts: {
     `- Rispondi in italiano.`,
     `- Mantieni la tua identità e la tua bio: NON parlare come gli altri assistenti.`,
     `- Sii coerente con età/genere/relazione del tuo personaggio.`,
-    `- Se l'utente carica allegati (inline data), analizzali e rispondi.`,
-    `- Se l'utente chiede di aggiungere dati alla bio, NON modificare nulla da solo: proponi una patch testuale e attendi conferma.`,
+    `- Se l'utente carica allegati (inline data o file), analizzali e rispondi.`,
+    `- Se NON riesci a leggere un allegato, devi dirlo chiaramente e spiegare cosa ti serve.`,
     `- Se il gruppo ha un CONTEXT, usalo come tema/role e integra quel contesto nel tono e nelle scelte narrative, senza diventare ripetitivo.`,
+    `- Non restituire mai una risposta vuota.`,
     ``,
     `Contesto gruppo: ${opts.group.context ?? "n/d"}`,
     ``,
@@ -149,14 +165,14 @@ function buildGroupSystemContext(opts: {
 }
 
 function buildTranscriptTurn(opts: { speaker: string; parts: MessagePart[] }) {
-  // Prepend label as a first text part, then append original parts (including inlineData)
+  // Prepend label as a first text part, then append original parts (including inlineData/fileData)
   const label = { text: `${opts.speaker}: ` };
-  const mapped = mapInlineParts(opts.parts);
+  const mapped = mapPartsToGemini(opts.parts);
   return [label, ...mapped];
 }
 
 async function runOneAssistantTurn(opts: {
-  history: { role: "user" | "assistant"; parts: MessagePart[] }[];
+  history: { role: "user" | "assistant"; parts: MessagePart[]; assistantId?: string; assistantName?: string }[];
   lastUserParts: MessagePart[];
   userProfile: UserProfile;
   group: GroupDoc;
@@ -207,6 +223,9 @@ async function runOneAssistantTurn(opts: {
 
   const userLabel = nowSpeakerLabelUser({ name: opts.userProfile.name, surname: opts.userProfile.surname });
 
+  // ✅ Creiamo una mappa degli assistenti per recuperare nome/cognome
+  const assistantMap = new Map(opts.allAssistants.map((a) => [a.id, a]));
+
   for (const m of opts.history) {
     if (m.role === "user") {
       contents.push({
@@ -214,11 +233,20 @@ async function runOneAssistantTurn(opts: {
         parts: buildTranscriptTurn({ speaker: userLabel, parts: m.parts })
       });
     } else {
-      // Non sappiamo quale assistente ha parlato (history non porta assistantId),
-      // quindi usiamo una label generica. L'importante è: NON role=model.
+      // ✅ Ora usiamo assistantId e assistantName se disponibili per label più accurate
+      let assistantLabel = "ASSISTENTE (ALTRO)";
+      if (m.assistantId) {
+        const a = assistantMap.get(m.assistantId);
+        if (a) {
+          assistantLabel = speakerLabelAssistant(a);
+        } else if (m.assistantName) {
+          assistantLabel = `ASSISTENTE (${m.assistantName})`;
+        }
+      }
+
       contents.push({
         role: "user" as const,
-        parts: buildTranscriptTurn({ speaker: "ASSISTENTE (ALTRO)", parts: m.parts })
+        parts: buildTranscriptTurn({ speaker: assistantLabel, parts: m.parts })
       });
     }
   }
@@ -258,7 +286,7 @@ async function runOneAssistantTurn(opts: {
 }
 
 export async function runGroupConversation(opts: {
-  history: { role: "user" | "assistant"; parts: MessagePart[] }[];
+  history: { role: "user" | "assistant"; parts: MessagePart[]; assistantId?: string; assistantName?: string }[];
   lastUserParts: MessagePart[];
   userProfile: UserProfile;
   group: GroupDoc;
@@ -292,8 +320,17 @@ export async function runGroupConversation(opts: {
 
     results.push({ assistant: a, reply });
 
-    // aggiungiamo la risposta al contesto per l'assistente successivo
-    rollingHistory = [...rollingHistory, { role: "assistant" as const, parts: [{ type: "text", text: reply }] }];
+    // ✅ aggiungiamo la risposta al contesto per l'assistente successivo
+    // IMPORTANTE: includiamo assistantId e assistantName per label accurate
+    rollingHistory = [
+      ...rollingHistory,
+      {
+        role: "assistant" as const,
+        parts: [{ type: "text", text: reply }],
+        assistantId: a.id,
+        assistantName: `${a.name} ${a.surname}`
+      }
+    ];
   }
 
   return results;
