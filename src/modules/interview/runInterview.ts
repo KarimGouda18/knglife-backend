@@ -115,7 +115,7 @@ export async function generateInterviewSummaryBio(opts: {
 
   const prompt = [
     `Genera una BIO in italiano come riepilogo dell'intervista qui sotto.`,
-    `Stile: utile, concreta, naturale, dettagliata. Non hai limiti di caratteri, evita però ripetizioni inutili ed assicurati di includere tutte le informazioni. Parla sempre in prima persona, come se fossi la persona intervistata.`,
+    `Stile: utile, concreta, naturale, dettagliata. Non hai limiti di caratteri, evita però ripetizioni inutili ed assicurati di includere tutte le informazioni. Parla sempre in prima persona, come se fossi la persona intervistata. Non generare frasi troppo corte e striminzite, la Bio deve essere fluida e ben articolata, si tratta più che di un riepilogo della bio che l'utente usa per far conoscere séstesso.`,
     `La bio deve essere adatta a KNGLife e descrivere la persona, i suoi interessi, obiettivi, routine e preferenze. Assicurati di includere tutti i dettagli raccolti durante l'intervista; ogni dettaglio, anche il più piccolo, è importante.`,
     allowExplicit
       ? `NSFW ON: puoi includere anche aspetti intimi/relazionali emersi nell'intervista.`
@@ -136,7 +136,12 @@ export async function generateInterviewSummaryBio(opts: {
   const resp = await ai.models.generateContent({
     model: env.GEMINI_TEXT_MODEL,
     contents: prompt,
-    config: { safetySettings }
+    config: {
+      safetySettings,
+      thinkingConfig: {
+        thinkingLevel: "minimal",
+      }
+    }
   });
 
   const raw =
