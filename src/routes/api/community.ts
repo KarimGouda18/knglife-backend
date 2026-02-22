@@ -1,5 +1,6 @@
 // src/routes/api/community.ts
 import { Router } from "express";
+import { z } from "zod";
 import { requireAuth } from "../../shared/middleware/requireAuth.js";
 import { getFirestore } from "../../config/firebase.js";
 import { getOrCreateUserProfile } from "../../modules/users/userRepo.js";
@@ -62,9 +63,19 @@ apiCommunityRouter.get("/assistants/:id", async (req, res, next) => {
 /**
  * POST /api/community/assistants/:id/clone
  * Clona un assistente pubblico nel profilo dell'utente (nuovo id, privato di default).
+ *
+ * Body opzionale:
+ *   - relationship: stringa (max 120 car.) per sovrascrivere la relazione con il clonatore.
+ *     Se omessa, viene mantenuta quella originale dell'assistente sorgente.
  */
 apiCommunityRouter.post("/assistants/:id/clone", async (req, res, next) => {
   try {
+    const Body = z.object({
+      relationship: z.string().min(1).max(120).optional()
+    });
+
+    const { relationship: customRelationship } = Body.parse(req.body);
+
     const db = getFirestore();
 
     const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
@@ -83,28 +94,37 @@ apiCommunityRouter.post("/assistants/:id/clone", async (req, res, next) => {
     const now = new Date().toISOString();
     const id = newAssistantId();
 
+    // La relazione viene sovrascritta se l'utente ne specifica una; altrimenti si mantiene quella originale.
+    const relationship =
+      typeof customRelationship === "string" && customRelationship.trim()
+        ? customRelationship.trim()
+        : source.relationship;
+
     const cloned: AssistantDoc = {
       id,
       ownerUid: req.user!.uid,
 
-      // Copia “identità” e contenuti
       name: source.name,
       surname: source.surname,
       age: source.age,
       gender: source.gender,
-      relationship: source.relationship,
+      relationship,
 
       bio: source.bio,
       bioMode: source.bioMode,
 
       avatarSpec: source.avatarSpec,
-      // Nota: qui copiamo l'avatar così com'è (incluso downloadUrl).
-      // In futuro possiamo aggiungere un endpoint "re-avatar" per rigenerarlo sotto il nuovo owner/id.
+      // Copiamo l'avatar così com'è (includendo downloadUrl).
+      // L'utente può rigenerarlo via POST /:id/avatar/generate dopo il clone.
       avatar: source.avatar ?? null,
 
       nsfwEnabled: source.nsfwEnabled,
 
-      // Il clone nasce privato (l’utente può pubblicarlo dopo)
+      voiceName: source.voiceName ?? "Kore",
+
+      ...(source.persona != null ? { persona: source.persona } : {}),
+
+      // Il clone nasce privato; l'utente può pubblicarlo in seguito
       isPublic: false,
       publishedAt: null,
 

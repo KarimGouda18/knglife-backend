@@ -7,8 +7,10 @@ import { getFirestore } from "../../config/firebase.js";
 import { getOrCreateUserProfile } from "../../modules/users/userRepo.js";
 import { sanitizeDeep } from "../../shared/utils/sanitizeDeep.js";
 import { getGroup, resolveGroupAssistants } from "../../modules/groups/groupsRepo.js";
-import { runGroupConversation } from "../../modules/groups/runGroupConversation.js";
+import { runGroupConversation, type AssistantMemoryEntry } from "../../modules/groups/runGroupConversation.js";
 import { uploadBytesToStorage } from "../../shared/utils/storage.js";
+import { buildAssistantRecallContext } from "../../modules/conversations/recall.js";
+import { upsertAssistantMemory } from "../../modules/assistants/assistantMemory.js";
 import {
   addGroupMessage,
   createGroupConversation,
@@ -125,7 +127,6 @@ apiGroupConversationsRouter.get("/:id/messages", async (req, res, next) => {
   }
 });
 
-// ✅ NUOVO: Upload file per conversazioni di gruppo
 apiGroupConversationsRouter.post("/:id/upload", upload.single("file"), async (req, res, next) => {
   try {
     const db = getFirestore();
@@ -181,45 +182,70 @@ apiGroupConversationsRouter.post("/:id/message", async (req, res, next) => {
 
     const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
 
-    // resolve assistants del gruppo
     const assistants = await resolveGroupAssistants({
       db,
       ownerUid: req.user!.uid,
       assistantIds: group.assistantIds
     });
 
-    // ✅ PRIMA leggiamo la history ESISTENTE (senza il nuovo messaggio)
+    // ✅ Pre-carica memoria e recall per ogni assistente del gruppo in parallelo.
+    //    È la stessa memoria condivisa con le conversazioni singole.
+    const memoryEntries = await Promise.all(
+      assistants.map((a) =>
+        buildAssistantRecallContext({
+          db,
+          ownerUid: req.user!.uid,
+          assistantId: a.id,
+          excludeConversationId: undefined // nelle conversazioni di gruppo non c'è un id da escludere
+        }).then((entry) => ({ assistantId: a.id, ...entry }))
+      )
+    );
+
+    const memoryMap = new Map<string, AssistantMemoryEntry>(
+      memoryEntries.map(({ assistantId, assistantMemory, recallText }) => [
+        assistantId,
+        { assistantMemory, recallText }
+      ])
+    );
+
+    // ✅ Leggi la history ESISTENTE prima di salvare il nuovo messaggio
     const existingMsgs = await listGroupMessages(db, convo.id, 80);
     const history = existingMsgs.map((m) => ({
       role: m.role,
-      parts: m.parts
-    })) as { role: "user" | "assistant"; parts: any[] }[];
+      parts: m.parts,
+      assistantId: m.assistantId,
+      assistantName: m.assistantName
+    })) as { role: "user" | "assistant"; parts: any[]; assistantId?: string; assistantName?: string }[];
 
-    // ✅ POI salviamo il nuovo messaggio user
+    const userMsgText = parts
+      .map((p) => {
+        if (p.type === "text") return p.text;
+        if (p.type === "file_url") return `[file:${p.mimeType}]`;
+        return "";
+      })
+      .join(" ")
+      .trim();
+
+    // ✅ Salva il messaggio utente
     const userMsg = await addGroupMessage(db, convo.id, {
       role: "user",
-      content: parts
-        .map((p) => {
-          if (p.type === "text") return p.text;
-          if (p.type === "file_url") return `[file:${p.mimeType}]`;
-          return "";
-        })
-        .join(" ")
-        .trim(),
+      content: userMsgText,
       parts
     });
 
-    // ✅ Chiamiamo runGroupConversation con history SENZA il nuovo messaggio
-    // (viene passato separatamente in lastUserParts)
+    // ✅ Esegui la conversazione di gruppo con la memoria pre-caricata
     const replies = await runGroupConversation({
       history,
       lastUserParts: parts,
       userProfile,
       group,
-      assistants
+      assistants,
+      memoryMap
     });
 
+    // ✅ Salva le risposte e aggiorna la memoria di ogni assistente (best-effort, in parallelo)
     const assistantMessages = [];
+
     for (const r of replies) {
       const saved = await addGroupMessage(db, convo.id, {
         role: "assistant",
@@ -230,6 +256,28 @@ apiGroupConversationsRouter.post("/:id/message", async (req, res, next) => {
       });
       assistantMessages.push(saved);
     }
+
+    // ✅ Aggiorna la memoria per ogni assistente che ha risposto.
+    //    Stessa collezione usata dalle conversazioni singole → memoria unificata.
+    const memoryUpdateTasks = replies.map((r) => {
+      const memEntry = memoryMap.get(r.assistant.id) ?? { assistantMemory: "", recallText: "" };
+      return upsertAssistantMemory({
+        db,
+        ownerUid: req.user!.uid,
+        assistant: {
+          id: r.assistant.id,
+          name: r.assistant.name,
+          surname: r.assistant.surname,
+          nsfwEnabled: r.assistant.nsfwEnabled,
+          relationship: r.assistant.relationship
+        },
+        user: { birthDate: userProfile.birthDate, nsfwEnabled: userProfile.nsfwEnabled },
+        currentMemory: memEntry.assistantMemory,
+        newConversationDelta: `[Chat di gruppo: ${group.name}]\nUtente: ${userMsgText}\n${r.assistant.name}: ${r.reply}`
+      });
+    });
+
+    await Promise.allSettled(memoryUpdateTasks);
 
     return res.status(200).json(
       sanitizeDeep({

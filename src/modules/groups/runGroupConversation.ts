@@ -38,11 +38,10 @@ function normalizeInlineBase64(input: string) {
   return input.trim();
 }
 
-// ✅ Rinominato e aggiunto supporto file_url
 function mapPartsToGemini(parts: MessagePart[]) {
   return parts.map((p) => {
     if (p.type === "text") return { text: p.text };
-    
+
     if (p.type === "inline_data") {
       return {
         inlineData: {
@@ -85,7 +84,7 @@ function extractTextFromParts(parts: MessagePart[]) {
 function cleanMentionToken(s: string) {
   return s
     .trim()
-    .replace(/[^\p{L}\p{N}_-]+/gu, "") // rimuove punteggiatura finale tipo "," ":" "."
+    .replace(/[^\p{L}\p{N}_-]+/gu, "")
     .toLowerCase();
 }
 
@@ -136,6 +135,8 @@ function buildGroupSystemContext(opts: {
     "id" | "name" | "surname" | "age" | "gender" | "relationship" | "bio" | "nsfwEnabled" | "avatarSpec"
   >;
   otherAssistants: { id: string; name: string; surname: string }[];
+  assistantMemory: string;
+  recallText: string;
 }) {
   const payload = {
     user: opts.user,
@@ -143,6 +144,9 @@ function buildGroupSystemContext(opts: {
     assistant: opts.assistant,
     otherAssistants: opts.otherAssistants
   };
+
+  const mem = (opts.assistantMemory ?? "").trim();
+  const recall = (opts.recallText ?? "").trim();
 
   return [
     `Sei "${opts.assistant.name} ${opts.assistant.surname}" (assistantId: ${opts.assistant.id}).`,
@@ -157,6 +161,12 @@ function buildGroupSystemContext(opts: {
     `- Se il gruppo ha un CONTEXT, usalo come tema/role e integra quel contesto nel tono e nelle scelte narrative, senza diventare ripetitivo.`,
     `- Non restituire mai una risposta vuota.`,
     ``,
+    `MEMORIA A LUNGO TERMINE (tua, personale):`,
+    mem || "(vuota)",
+    ``,
+    `RICHIAMI DA CONVERSAZIONI PRECEDENTI CON QUESTO UTENTE (se utili):`,
+    recall || "(nessuno)",
+    ``,
     `Contesto gruppo: ${opts.group.context ?? "n/d"}`,
     ``,
     `Profili (JSON):`,
@@ -165,7 +175,6 @@ function buildGroupSystemContext(opts: {
 }
 
 function buildTranscriptTurn(opts: { speaker: string; parts: MessagePart[] }) {
-  // Prepend label as a first text part, then append original parts (including inlineData/fileData)
   const label = { text: `${opts.speaker}: ` };
   const mapped = mapPartsToGemini(opts.parts);
   return [label, ...mapped];
@@ -179,6 +188,8 @@ async function runOneAssistantTurn(opts: {
   assistant: AssistantDoc;
   allAssistants: AssistantDoc[];
   groupHasNsfw: boolean;
+  assistantMemory: string;
+  recallText: string;
 }): Promise<string> {
   const ai = getGenAI();
 
@@ -215,7 +226,9 @@ async function runOneAssistantTurn(opts: {
     },
     otherAssistants: opts.allAssistants
       .filter((a) => a.id !== opts.assistant.id)
-      .map((a) => ({ id: a.id, name: a.name, surname: a.surname }))
+      .map((a) => ({ id: a.id, name: a.name, surname: a.surname })),
+    assistantMemory: opts.assistantMemory,
+    recallText: opts.recallText
   });
 
   // ✅ CRITICAL: tutto come trascrizione user-side
@@ -223,7 +236,6 @@ async function runOneAssistantTurn(opts: {
 
   const userLabel = nowSpeakerLabelUser({ name: opts.userProfile.name, surname: opts.userProfile.surname });
 
-  // ✅ Creiamo una mappa degli assistenti per recuperare nome/cognome
   const assistantMap = new Map(opts.allAssistants.map((a) => [a.id, a]));
 
   for (const m of opts.history) {
@@ -233,7 +245,6 @@ async function runOneAssistantTurn(opts: {
         parts: buildTranscriptTurn({ speaker: userLabel, parts: m.parts })
       });
     } else {
-      // ✅ Ora usiamo assistantId e assistantName se disponibili per label più accurate
       let assistantLabel = "ASSISTENTE (ALTRO)";
       if (m.assistantId) {
         const a = assistantMap.get(m.assistantId);
@@ -257,8 +268,6 @@ async function runOneAssistantTurn(opts: {
     parts: buildTranscriptTurn({ speaker: userLabel, parts: opts.lastUserParts })
   });
 
-  // Log utile per verificare che Gemini venga chiamato N volte (una per assistente)
-  // eslint-disable-next-line no-console
   console.log("[group-chat] generating for", opts.assistant.id, opts.assistant.name, opts.assistant.surname);
 
   const resp = await ai.models.generateContent({
@@ -285,16 +294,22 @@ async function runOneAssistantTurn(opts: {
   return out;
 }
 
+export type AssistantMemoryEntry = {
+  assistantMemory: string;
+  recallText: string;
+};
+
 export async function runGroupConversation(opts: {
   history: { role: "user" | "assistant"; parts: MessagePart[]; assistantId?: string; assistantName?: string }[];
   lastUserParts: MessagePart[];
   userProfile: UserProfile;
   group: GroupDoc;
   assistants: AssistantDoc[];
+  /** Mappa assistantId → { assistantMemory, recallText } — stessa memoria usata nelle conversazioni singole */
+  memoryMap: Map<string, AssistantMemoryEntry>;
 }): Promise<{ assistant: AssistantDoc; reply: string }[]> {
   const lastText = extractTextFromParts(opts.lastUserParts);
 
-  // ✅ mention solo se matcha davvero un assistente del gruppo
   const mentioned = detectMentionedAssistant({ text: lastText, assistants: opts.assistants });
 
   const targets = mentioned ? [mentioned] : pickRandomOrder(opts.assistants);
@@ -303,11 +318,11 @@ export async function runGroupConversation(opts: {
 
   const results: { assistant: AssistantDoc; reply: string }[] = [];
 
-  // rollingHistory è la storia "logica": ogni risposta generata viene aggiunta qui
-  // così l'assistente successivo la vede in contesto.
   let rollingHistory = [...opts.history];
 
   for (const a of targets) {
+    const memEntry = opts.memoryMap.get(a.id) ?? { assistantMemory: "", recallText: "" };
+
     const reply = await runOneAssistantTurn({
       history: rollingHistory,
       lastUserParts: opts.lastUserParts,
@@ -315,13 +330,13 @@ export async function runGroupConversation(opts: {
       group: opts.group,
       assistant: a,
       allAssistants: opts.assistants,
-      groupHasNsfw
+      groupHasNsfw,
+      assistantMemory: memEntry.assistantMemory,
+      recallText: memEntry.recallText
     });
 
     results.push({ assistant: a, reply });
 
-    // ✅ aggiungiamo la risposta al contesto per l'assistente successivo
-    // IMPORTANTE: includiamo assistantId e assistantName per label accurate
     rollingHistory = [
       ...rollingHistory,
       {
