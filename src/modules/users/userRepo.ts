@@ -24,6 +24,9 @@ export type UserProfile = {
 
   onboardingCompleted: boolean;
 
+  /** ISO timestamp updated by the client heartbeat. Used by the nudge system to detect real inactivity. */
+  lastActiveAt?: string | null;
+
   createdAt: string;
   updatedAt: string;
 };

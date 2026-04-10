@@ -6,9 +6,9 @@ export function guideName() {
 }
 
 /**
- * ✅ Questa stringa DEVE rimanere allineata al “system” usato nella interview testuale.
- * La riusiamo sia per la text interview (generateNextInterviewQuestion)
- * sia per la live interview (systemInstruction della sessione realtime).
+ * Builds the system instruction for the onboarding interview (Dora).
+ * Shared by both the text interview (REST) and the live audio interview (WebSocket).
+ * The live session prepends a short voice-mode note before this string.
  */
 export function buildInterviewSystemInstruction(opts: {
   user: Pick<UserProfile, "name" | "surname" | "age" | "gender" | "visualDisabilityLevel">;

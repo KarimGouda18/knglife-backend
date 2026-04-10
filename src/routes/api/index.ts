@@ -8,6 +8,7 @@ import { apiConversationsRouter } from "./conversations.js";
 import { apiGroupsRouter } from "./groups.js";
 import { apiGroupConversationsRouter } from "./groupConversations.js";
 import { apiNudgesRouter } from "./nudges.js";
+import { apiVoicesRouter } from "./voices.js";
 
 export const apiRouter = Router();
 
@@ -22,5 +23,5 @@ apiRouter.use("/conversations", apiConversationsRouter);
 apiRouter.use("/groups", apiGroupsRouter);
 apiRouter.use("/group-conversations", apiGroupConversationsRouter);
 
-// ✅ nudge (estemporanei)
 apiRouter.use("/nudges", apiNudgesRouter);
+apiRouter.use("/voices", apiVoicesRouter);

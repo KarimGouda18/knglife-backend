@@ -328,8 +328,8 @@ apiConversationsRouter.post("/:id/generate/image", async (req, res, next) => {
 
     const msg = await addMessage(db, convo.id, {
       role: "assistant",
-      content: `Ho generato un immagine: ${media.downloadUrl}`,
-      parts: [{ type: "text", text: `Ho generato un immagine: ${media.downloadUrl}` }]
+      content: `Generated an image: ${media.downloadUrl}`,
+      parts: [{ type: "text", text: `Generated an image: ${media.downloadUrl}` }]
     });
 
     return res.status(200).json(sanitizeDeep({ ok: true, media, message: msg }));
@@ -340,12 +340,19 @@ apiConversationsRouter.post("/:id/generate/image", async (req, res, next) => {
 
 apiConversationsRouter.post("/:id/generate/video", async (req, res, next) => {
   try {
-    const Body = z.object({
-      prompt: z.string().min(1).max(4000),
-      useAssistantAvatar: z.boolean().optional(),
-      durationSeconds: z.number().int().min(4).max(148).optional()
-    });
-    const { prompt, useAssistantAvatar, durationSeconds } = Body.parse(req.body);
+    const Body = z.discriminatedUnion("mode", [
+      z.object({
+        mode: z.literal("single"),
+        prompt: z.string().min(1).max(4000),
+        useAssistantAvatar: z.boolean().optional()
+      }),
+      z.object({
+        mode: z.literal("multi"),
+        scenes: z.array(z.string().min(1).max(4000)).min(2).max(8),
+        useAssistantAvatar: z.boolean().optional()
+      })
+    ]);
+    const input = Body.parse(req.body);
 
     const db = getFirestore();
 
@@ -362,19 +369,22 @@ apiConversationsRouter.post("/:id/generate/video", async (req, res, next) => {
     const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
 
     const media = await generateConversationVideo({
+      ...input,
       ownerUid: req.user!.uid,
       conversationId: convo.id,
-      prompt,
-      durationSeconds,
-      useAssistantAvatar: !!useAssistantAvatar,
       user: { birthDate: userProfile.birthDate, nsfwEnabled: userProfile.nsfwEnabled },
       assistant: { nsfwEnabled: assistant.nsfwEnabled, avatar: assistant.avatar }
     });
 
+    const sceneCount = input.mode === "multi" ? input.scenes.length : 1;
+    const description = input.mode === "multi"
+      ? `Generated a ${sceneCount}-scene video: ${media.downloadUrl}`
+      : `Generated a video: ${media.downloadUrl}`;
+
     const msg = await addMessage(db, convo.id, {
       role: "assistant",
-      content: `Ho generato un video: ${media.downloadUrl}`,
-      parts: [{ type: "text", text: `Ho generato un video: ${media.downloadUrl}` }]
+      content: description,
+      parts: [{ type: "text", text: description }]
     });
 
     return res.status(200).json(sanitizeDeep({ ok: true, media, message: msg }));

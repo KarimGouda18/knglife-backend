@@ -18,9 +18,10 @@ const EnvSchema = z.object({
   GEMINI_TEXT_MODEL: z.string().min(1).default("gemini-3-pro-preview"),
   GEMINI_IMAGE_MODEL: z.string().min(1).default("gemini-3-pro-image-preview"),
   GEMINI_REALTIME_MODEL: z.string().min(1).default("gemini-2.5-flash-native-audio-preview-12-2025"),
+  GEMINI_TTS_MODEL: z.string().min(1).default("gemini-2.5-flash-preview-tts"),
   VEO_VIDEO_MODEL: z.string().min(1).default("veo-3.1"),
 
-  // Sicurezza: in produzione tienilo false. In dev puoi metterlo true se serve.
+  // Set to "true" only in development when custom Firebase tokens are needed.
   ALLOW_CUSTOM_TOKENS: z
     .enum(["true", "false"])
     .default("false")

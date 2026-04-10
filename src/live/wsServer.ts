@@ -9,7 +9,8 @@ import { getGenAI } from "../config/genai.js";
 import { getGeminiSafetySettings } from "../shared/utils/safety.js";
 import { getOrCreateUserProfile } from "../modules/users/userRepo.js";
 import { getAssistant } from "../modules/assistants/assistantsRepo.js";
-import { buildAssistantLiveSystemPrompt, buildInterviewLiveSystemPrompt } from "./prompts.js";
+import { buildAssistantLiveSystemPrompt } from "./prompts.js";
+import { buildInterviewSystemInstruction } from "../modules/interview/interviewPrompts.js";
 import { addInterviewMessage, createInterview, getInterview } from "../modules/interview/interviewRepo.js";
 import {
   addMessage,
@@ -25,25 +26,21 @@ import { generateConversationTitle } from "../modules/conversations/generateTitl
 import { upsertAssistantMemory } from "../modules/assistants/assistantMemory.js";
 
 /**
- * Protocollo WS (client -> server):
+ * WebSocket protocol — client → server:
  * - { type: "input_audio", dataBase64: string, mimeType?: string }
  * - { type: "input_video", dataBase64: string, mimeType?: string }
- * - { type: "input_text", text: string }
+ * - { type: "input_text",  text: string }
  * - { type: "end_turn" }
  * - { type: "close" }
+ * Legacy aliases: "audio", "video", "realtime_input"
  *
- * Compatibilità extra:
- * - { type: "audio", dataBase64: string, mimeType?: string }
- * - { type: "video", dataBase64: string, mimeType?: string }
- * - { type: "realtime_input", audio?: {...}, video?: {...} }
- *
- * Server -> client:
- * - { type: "ready", session: {...}, interviewId?: string, conversationId?: string }
- * - { type: "output_audio", dataBase64: string, mimeType: string }
+ * Server → client:
+ * - { type: "ready",               session: {...}, interviewId?: string, conversationId?: string }
+ * - { type: "output_audio",        dataBase64: string, mimeType: string }
  * - { type: "output_transcription", text: string }
  * - { type: "input_transcription", text: string }
- * - { type: "raw", message: any }
- * - { type: "error", error: string }
+ * - { type: "raw",                 message: any }
+ * - { type: "error",               error: string }
  */
 
 type ClientMsg =
@@ -374,7 +371,7 @@ class LiveConversationSaver {
     const lastUserText = this.pendingUserText ?? "(audio)";
     this.pendingUserText = null;
 
-    // titolo se mancante e primo scambio (se la convo è senza titolo e non ha summary)
+    // Generate a title on the first exchange if the conversation has none yet
     const titleMissing = !this.convo.title || !this.convo.title.trim();
     const isFirstExchange = !this.convo.summary;
 
@@ -544,16 +541,16 @@ export function attachLiveWebSocketServer(server: http.Server) {
         });
         const allowExplicit = safetyForAllowExplicit[0]?.threshold === "BLOCK_NONE";
 
-        systemPrompt = buildInterviewLiveSystemPrompt({
+        // Prepend a voice-mode note so the model keeps audio responses concise,
+        // then use the same rich "Dora" prompt as the text interview.
+        const voicePrefix = "You are in a live voice session: keep your responses short and natural.\n\n";
+        systemPrompt = voicePrefix + buildInterviewSystemInstruction({
           user: {
             name: userProfile.name,
             surname: userProfile.surname,
-            birthDate: userProfile.birthDate,
             age: userProfile.age,
             gender: userProfile.gender,
-            visualDisabilityLevel: userProfile.visualDisabilityLevel,
-            bio: userProfile.bio,
-            nsfwEnabled: userProfile.nsfwEnabled
+            visualDisabilityLevel: userProfile.visualDisabilityLevel
           },
           interviewNsfwEnabled,
           allowExplicit
@@ -581,7 +578,7 @@ export function attachLiveWebSocketServer(server: http.Server) {
         const voiceFromQuery = url.searchParams.get("voiceName");
         voiceName = (voiceFromQuery || pickVoiceName(assistant)).trim() || "Kore";
 
-        // conversationId opzionale: se non c'è, creiamo una nuova conversazione live
+        // Optional conversationId — create a new live conversation if not provided
         const requestedConversationId = url.searchParams.get("conversationId");
         if (requestedConversationId) {
           const existing = await getConversation(db, requestedConversationId);
