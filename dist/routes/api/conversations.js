@@ -287,6 +287,13 @@ apiConversationsRouter.post("/:id/generate/video", async (req, res, next) => {
         const Body = z.object({
             prompt: z.string().min(1).max(4000),
             useAssistantAvatar: z.boolean().optional(),
+            /**
+             * When false the server skips adding a message to the conversation.
+             * The client should call POST /:id/save-video when the user is done
+             * extending and wants a single final message in the chat.
+             * Defaults to true for backward compatibility.
+             */
+            addToChat: z.boolean().optional().default(true),
             /** Pass the `geminiVideoRef` from a previous response to extend that clip. */
             geminiVideoRef: z.object({
                 uri: z.string().optional(),
@@ -313,17 +320,52 @@ apiConversationsRouter.post("/:id/generate/video", async (req, res, next) => {
             user: { birthDate: userProfile.birthDate, nsfwEnabled: userProfile.nsfwEnabled },
             assistant: { nsfwEnabled: assistant.nsfwEnabled, avatar: assistant.avatar }
         });
-        const isExtension = !!input.geminiVideoRef?.uri;
-        const description = isExtension
-            ? `Extended the video: ${uploadedFile.downloadUrl}`
-            : `Generated a video: ${uploadedFile.downloadUrl}`;
+        if (input.addToChat !== false) {
+            const isExtension = !!input.geminiVideoRef?.uri;
+            const label = isExtension ? "Video esteso" : "Video generato";
+            const description = isExtension
+                ? `Video esteso: ${uploadedFile.downloadUrl}`
+                : `Video generato: ${uploadedFile.downloadUrl}`;
+            await addMessage(db, convo.id, {
+                role: "assistant",
+                content: description,
+                parts: [
+                    { type: "text", text: description },
+                    { type: "file_url", mimeType: "video/mp4", url: uploadedFile.downloadUrl, displayName: label }
+                ]
+            });
+        }
+        // Return `geminiVideoRef` so the client can extend this clip in the next call.
+        return res.status(200).json(sanitizeDeep({ ok: true, media: uploadedFile, geminiVideoRef }));
+    }
+    catch (err) {
+        return next(err);
+    }
+});
+/** Saves a single media message (video or image URL) to the conversation without triggering an AI reply. */
+apiConversationsRouter.post("/:id/save-video", async (req, res, next) => {
+    try {
+        const Body = z.object({
+            url: z.string().url(),
+            mimeType: z.string().min(1).default("video/mp4"),
+            displayName: z.string().max(200).optional()
+        });
+        const { url, mimeType, displayName } = Body.parse(req.body);
+        const db = getFirestore();
+        const convo = await getConversation(db, req.params.id);
+        if (!convo || convo.ownerUid !== req.user.uid) {
+            return res.status(404).json({ ok: false, error: "CONVERSATION_NOT_FOUND" });
+        }
+        const label = displayName ?? (mimeType.startsWith("video/") ? "Video generato" : "Media generato");
         const msg = await addMessage(db, convo.id, {
             role: "assistant",
-            content: description,
-            parts: [{ type: "text", text: description }]
+            content: label,
+            parts: [
+                { type: "text", text: label },
+                { type: "file_url", mimeType, url, displayName: label }
+            ]
         });
-        // Return `geminiVideoRef` so the client can extend this clip in the next call.
-        return res.status(200).json(sanitizeDeep({ ok: true, media: uploadedFile, geminiVideoRef, message: msg }));
+        return res.status(200).json(sanitizeDeep({ ok: true, message: msg }));
     }
     catch (err) {
         return next(err);
