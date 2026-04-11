@@ -257,7 +257,7 @@ export async function generateConversationVideo(opts: {
     numberOfVideos: 1,
     resolution: "720p",
     aspectRatio: "16:9",
-    personGeneration: "allow_adult"
+    personGeneration: "allow_all"
   };
 
   const hasAvatar = !!opts.assistant.avatar?.downloadUrl;
