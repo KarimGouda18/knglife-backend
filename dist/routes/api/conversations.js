@@ -273,8 +273,8 @@ apiConversationsRouter.post("/:id/generate/image", async (req, res, next) => {
         });
         const msg = await addMessage(db, convo.id, {
             role: "assistant",
-            content: `Ho generato un immagine: ${media.downloadUrl}`,
-            parts: [{ type: "text", text: `Ho generato un immagine: ${media.downloadUrl}` }]
+            content: `Generated an image: ${media.downloadUrl}`,
+            parts: [{ type: "text", text: `Generated an image: ${media.downloadUrl}` }]
         });
         return res.status(200).json(sanitizeDeep({ ok: true, media, message: msg }));
     }
@@ -287,9 +287,13 @@ apiConversationsRouter.post("/:id/generate/video", async (req, res, next) => {
         const Body = z.object({
             prompt: z.string().min(1).max(4000),
             useAssistantAvatar: z.boolean().optional(),
-            durationSeconds: z.number().int().min(4).max(148).optional()
+            /** Pass the `geminiVideoRef` from a previous response to extend that clip. */
+            geminiVideoRef: z.object({
+                uri: z.string().optional(),
+                name: z.string().optional()
+            }).optional()
         });
-        const { prompt, useAssistantAvatar, durationSeconds } = Body.parse(req.body);
+        const input = Body.parse(req.body);
         const db = getFirestore();
         const convo = await getConversation(db, req.params.id);
         if (!convo || convo.ownerUid !== req.user.uid) {
@@ -300,21 +304,26 @@ apiConversationsRouter.post("/:id/generate/video", async (req, res, next) => {
             return res.status(404).json({ ok: false, error: "ASSISTANT_NOT_FOUND" });
         }
         const userProfile = await getOrCreateUserProfile(db, req.user.uid, req.user.email ?? null);
-        const media = await generateConversationVideo({
+        const { uploadedFile, geminiVideoRef } = await generateConversationVideo({
             ownerUid: req.user.uid,
             conversationId: convo.id,
-            prompt,
-            durationSeconds,
-            useAssistantAvatar: !!useAssistantAvatar,
+            prompt: input.prompt,
+            useAssistantAvatar: input.useAssistantAvatar,
+            geminiVideoRef: input.geminiVideoRef,
             user: { birthDate: userProfile.birthDate, nsfwEnabled: userProfile.nsfwEnabled },
             assistant: { nsfwEnabled: assistant.nsfwEnabled, avatar: assistant.avatar }
         });
+        const isExtension = !!input.geminiVideoRef?.uri || !!input.geminiVideoRef?.name;
+        const description = isExtension
+            ? `Extended the video: ${uploadedFile.downloadUrl}`
+            : `Generated a video: ${uploadedFile.downloadUrl}`;
         const msg = await addMessage(db, convo.id, {
             role: "assistant",
-            content: `Ho generato un video: ${media.downloadUrl}`,
-            parts: [{ type: "text", text: `Ho generato un video: ${media.downloadUrl}` }]
+            content: description,
+            parts: [{ type: "text", text: description }]
         });
-        return res.status(200).json(sanitizeDeep({ ok: true, media, message: msg }));
+        // Return `geminiVideoRef` so the client can extend this clip in the next call.
+        return res.status(200).json(sanitizeDeep({ ok: true, media: uploadedFile, geminiVideoRef, message: msg }));
     }
     catch (err) {
         return next(err);

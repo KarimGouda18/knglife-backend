@@ -6,9 +6,7 @@ import { getGeminiSafetySettings } from "../../shared/utils/safety.js";
 import { uploadBytesToStorage } from "../../shared/utils/storage.js";
 import type { UserProfile } from "../users/userRepo.js";
 import type { AssistantDoc } from "../assistants/assistantsRepo.js";
-import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
-import path from "node:path";
 
 // ---------------------------------------------------------------------------
 // Internal utilities
@@ -92,55 +90,6 @@ async function downloadGenaiFileToBuffer(opts: { uri?: string; name?: string }):
 
   if (opts.uri) return await fetchVideoByUri(opts.uri);
   throw new Error("VIDEO_GENERATION_FAILED_NO_FILE_NAME");
-}
-
-/**
- * Concatenates multiple MP4 buffers into a single MP4 using FFmpeg's concat demuxer.
- * Input clips must share the same codec and resolution for lossless stream-copy to work.
- */
-async function concatenateVideos(videoBuffers: Buffer[]): Promise<Buffer> {
-  if (videoBuffers.length === 0) throw new Error("CONCATENATE_VIDEOS_NO_VIDEOS");
-  if (videoBuffers.length === 1) return videoBuffers[0];
-
-  const tmpDir = `/tmp/video-concat-${newId()}`;
-  await fs.mkdir(tmpDir, { recursive: true });
-
-  try {
-    const inputFiles: string[] = [];
-    for (let i = 0; i < videoBuffers.length; i++) {
-      const inputPath = path.join(tmpDir, `input_${i}.mp4`);
-      await fs.writeFile(inputPath, videoBuffers[i]);
-      inputFiles.push(inputPath);
-    }
-
-    const listPath = path.join(tmpDir, "list.txt");
-    await fs.writeFile(listPath, inputFiles.map(f => `file '${f}'`).join("\n"));
-
-    const outputPath = path.join(tmpDir, "output.mp4");
-
-    await new Promise<void>((resolve, reject) => {
-      const ffmpeg = spawn("ffmpeg", [
-        "-f", "concat", "-safe", "0",
-        "-i", listPath,
-        "-c", "copy",
-        outputPath
-      ]);
-      let stderr = "";
-      ffmpeg.stderr.on("data", (d) => { stderr += d.toString(); });
-      ffmpeg.on("close", (code) => {
-        if (code !== 0) reject(new Error(`FFMPEG_CONCAT_FAILED: exit code ${code}\n${stderr}`));
-        else resolve();
-      });
-      ffmpeg.on("error", (err) => reject(new Error(`FFMPEG_SPAWN_ERROR: ${err.message}`)));
-    });
-
-    const output = await fs.readFile(outputPath);
-    await fs.rm(tmpDir, { recursive: true, force: true });
-    return output;
-  } catch (error) {
-    try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    throw error;
-  }
 }
 
 /**
@@ -236,21 +185,41 @@ export async function generateConversationImage(opts: {
 }
 
 // ---------------------------------------------------------------------------
-// Video generation — single-scene mode
+// Video generation — generate or extend
 // ---------------------------------------------------------------------------
 
 /**
- * Generates a single 8-second video clip from one prompt.
- * Uses the avatar image as a reference frame when `useAssistantAvatar` is set.
+ * A minimal reference to a VEO-generated video that can be passed back
+ * to subsequent extension calls. Clients should store this and include it
+ * in the next request to extend the clip.
  */
-async function generateSingleSceneVideo(opts: {
+export type GeminiVideoRef = { uri?: string; name?: string };
+
+/**
+ * Generates a new video clip or extends an existing one using VEO's native
+ * extension API.
+ *
+ * **New video**: omit `geminiVideoRef`. VEO generates an 8-second clip from
+ * the prompt (+ optional avatar reference image).
+ *
+ * **Extension**: pass `geminiVideoRef` from the previous response. VEO uses
+ * the previous clip for visual/world/character continuity and generates a new
+ * extended clip (the returned video is the complete extended version — no
+ * concatenation required). The process can be repeated up to ~240 seconds.
+ *
+ * Returns both the uploaded file info and the `geminiVideoRef` to use for the
+ * next extension call.
+ */
+export async function generateConversationVideo(opts: {
   ownerUid: string;
   conversationId: string;
   prompt: string;
   user: MediaUserOpts;
   assistant: MediaAssistantOpts;
   useAssistantAvatar?: boolean;
-}) {
+  /** If provided, extends the referenced clip instead of generating a new one. */
+  geminiVideoRef?: GeminiVideoRef;
+}): Promise<{ uploadedFile: Awaited<ReturnType<typeof uploadBytesToStorage>>; geminiVideoRef: GeminiVideoRef }> {
   const ai = getGenAI();
   const model = normalizeVeoModelName(env.VEO_VIDEO_MODEL);
   const safetySettings = getGeminiSafetySettings({
@@ -261,147 +230,47 @@ async function generateSingleSceneVideo(opts: {
 
   const config: any = { safetySettings, numberOfVideos: 1 };
   const hasAvatar = !!opts.assistant.avatar?.downloadUrl;
-  const useRef = !!opts.useAssistantAvatar && hasAvatar;
+  const isExtension = !!opts.geminiVideoRef?.uri || !!opts.geminiVideoRef?.name;
 
   let operation: any;
-  if (useRef) {
+
+  if (isExtension) {
+    // Extend the existing clip. VEO returns a new video that is the full
+    // extended version — the previous clip + the new content. No concatenation needed.
+    console.log("Video generation: extending existing clip");
+    operation = await (ai.models.generateVideos as any)({
+      model,
+      prompt: opts.prompt,
+      video: opts.geminiVideoRef,
+      config
+    });
+  } else if (opts.useAssistantAvatar && hasAvatar) {
+    // New video with avatar as reference image
+    console.log("Video generation: new clip with avatar reference");
     const { base64, mimeType } = await fetchAsBase64(opts.assistant.avatar!.downloadUrl);
-    operation = await ai.models.generateVideos({ model, prompt: opts.prompt, image: { imageBytes: base64, mimeType }, config });
+    operation = await (ai.models.generateVideos as any)({
+      model,
+      prompt: opts.prompt,
+      image: { imageBytes: base64, mimeType },
+      config
+    });
   } else {
-    operation = await ai.models.generateVideos({ model, prompt: opts.prompt, config });
+    // New video from prompt only
+    console.log("Video generation: new clip from prompt");
+    operation = await (ai.models.generateVideos as any)({ model, prompt: opts.prompt, config });
   }
 
   const videoRef = await pollVideoOperation(ai, operation);
   const bytes = await downloadVideoRef(videoRef);
 
   const storagePath = `conversations/${opts.ownerUid}/${opts.conversationId}/videos/${newId()}.mp4`;
-  return uploadBytesToStorage({ path: storagePath, bytes, contentType: "video/mp4" });
-}
+  const uploadedFile = await uploadBytesToStorage({ path: storagePath, bytes, contentType: "video/mp4" });
 
-// ---------------------------------------------------------------------------
-// Video generation — multi-scene mode
-// ---------------------------------------------------------------------------
+  // Extract a serialisable reference for the next extension call
+  const outRef: GeminiVideoRef = {};
+  if (videoRef?.uri) outRef.uri = videoRef.uri;
+  if (videoRef?.name) outRef.name = videoRef.name;
 
-/**
- * Generates a multi-scene video by chaining VEO extension calls.
- *
- * Each scene gets its own explicitly authored prompt (mirroring Google Flow's approach):
- * - Scene 0 is generated from scratch (with optional avatar reference image).
- * - Scene N (N > 0) is generated using the previous clip as the reference video plus
- *   the new scene prompt, giving VEO world/character/camera continuity while allowing
- *   a new narrative direction for each scene.
- *
- * Intermediate clips are stored individually for auditability. The final concatenated
- * video is stored at `videos/{sessionId}/final.mp4`.
- */
-async function generateMultiSceneVideo(opts: {
-  ownerUid: string;
-  conversationId: string;
-  scenes: string[];           // one prompt per scene, min 2, max 8
-  user: MediaUserOpts;
-  assistant: MediaAssistantOpts;
-  useAssistantAvatar?: boolean;
-}) {
-  const ai = getGenAI();
-  const model = normalizeVeoModelName(env.VEO_VIDEO_MODEL);
-  const safetySettings = getGeminiSafetySettings({
-    userBirthDate: opts.user.birthDate,
-    userNsfwEnabled: opts.user.nsfwEnabled,
-    assistantNsfwEnabled: opts.assistant.nsfwEnabled
-  });
-
-  const config: any = { safetySettings, numberOfVideos: 1 };
-  const sessionId = newId();
-  const videoBuffers: Buffer[] = [];
-
-  const hasAvatar = !!opts.assistant.avatar?.downloadUrl;
-  const useRef = !!opts.useAssistantAvatar && hasAvatar;
-
-  let previousVideoRef: any = null;
-
-  for (let i = 0; i < opts.scenes.length; i++) {
-    const scenePrompt = opts.scenes[i];
-    console.log(`Video multi-scene: generating scene ${i + 1}/${opts.scenes.length}`);
-
-    let operation: any;
-
-    if (i === 0) {
-      // First scene — no previous clip reference
-      if (useRef) {
-        const { base64, mimeType } = await fetchAsBase64(opts.assistant.avatar!.downloadUrl);
-        operation = await ai.models.generateVideos({
-          model, prompt: scenePrompt,
-          image: { imageBytes: base64, mimeType },
-          config
-        });
-      } else {
-        operation = await ai.models.generateVideos({ model, prompt: scenePrompt, config });
-      }
-    } else {
-      // Subsequent scenes — use the previous clip as reference to drive continuity.
-      // Cast to `any` because the SDK's TypeScript types do not yet expose the
-      // `video` extension parameter, even though the API supports it.
-      operation = await (ai.models.generateVideos as any)({
-        model,
-        prompt: scenePrompt,
-        video: previousVideoRef,
-        config
-      });
-    }
-
-    const videoRef = await pollVideoOperation(ai, operation);
-    const bytes = await downloadVideoRef(videoRef);
-    videoBuffers.push(bytes);
-
-    // Store the intermediate scene clip
-    const scenePath = `conversations/${opts.ownerUid}/${opts.conversationId}/videos/${sessionId}/scene_${i}.mp4`;
-    await uploadBytesToStorage({ path: scenePath, bytes, contentType: "video/mp4" });
-
-    // Keep the raw video reference for the next extension call
-    previousVideoRef = videoRef;
-    console.log(`Video multi-scene: scene ${i + 1} done (${bytes.length} bytes)`);
-  }
-
-  // Concatenate all scene clips and store the final video
-  const finalBytes = await concatenateVideos(videoBuffers);
-  const finalPath = `conversations/${opts.ownerUid}/${opts.conversationId}/videos/${sessionId}/final.mp4`;
-  return uploadBytesToStorage({ path: finalPath, bytes: finalBytes, contentType: "video/mp4" });
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/**
- * Generates a conversation video in one of two modes:
- *
- * - `single`: one VEO call → one 8-second clip.
- * - `multi`:  one VEO call per scene, chained via the extension API, then concatenated.
- *   Each scene must supply its own prompt; VEO uses the previous clip for visual continuity.
- */
-export async function generateConversationVideo(
-  opts:
-    | {
-        mode: "single";
-        ownerUid: string;
-        conversationId: string;
-        prompt: string;
-        user: MediaUserOpts;
-        assistant: MediaAssistantOpts;
-        useAssistantAvatar?: boolean;
-      }
-    | {
-        mode: "multi";
-        ownerUid: string;
-        conversationId: string;
-        scenes: string[];
-        user: MediaUserOpts;
-        assistant: MediaAssistantOpts;
-        useAssistantAvatar?: boolean;
-      }
-) {
-  if (opts.mode === "single") {
-    return generateSingleSceneVideo(opts);
-  }
-  return generateMultiSceneVideo(opts);
+  console.log(`Video generation: done (${bytes.length} bytes), ref:`, outRef);
+  return { uploadedFile, geminiVideoRef: outRef };
 }

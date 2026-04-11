@@ -160,31 +160,38 @@ apiNudgesRouter.post("/tick", async (req, res, next) => {
           assistantNsfwEnabled: !!a.nsfwEnabled
         });
 
-        const nudgePrompt = [
-          `You are an assistant in KNGLife. Send a brief, warm proactive message (nudge) to re-engage the user.`,
-          `Constraints:`,
-          `- Language: Italian`,
-          `- 1–2 sentences, max 220 characters`,
-          `- Warm and human tone, not pushy`,
-          `- No emoji`,
-          `- Suggest a small topic consistent with the assistant's memory and past conversations`,
+        // System instruction: all context that shapes who the assistant is and what
+        // they know. Kept separate from the trigger so Gemini treats it as a true
+        // system prompt and not as a user message.
+        const nudgeSystemInstruction = [
+          `You are ${a.name}${a.surname ? " " + a.surname : ""}, an AI companion in KNGLife.`,
+          `Your only task right now: write a brief, warm proactive message (a "nudge") to re-engage the user.`,
           ``,
-          `Assistant memory:`,
+          `Rules:`,
+          `- Reply in Italian`,
+          `- 1–2 sentences, maximum 220 characters total`,
+          `- Tone: warm and human, never pushy or robotic`,
+          `- No emoji`,
+          `- Tie the message naturally to something from the assistant's memory or the recent conversation`,
+          `- Output ONLY the nudge text — no preamble, no quotes, no labels`,
+          ``,
+          `=== Assistant memory ===`,
           assistantMemory?.trim() || "(empty)",
           ``,
-          `Recall from previous conversations:`,
+          `=== Recall from previous conversations ===`,
           recallText?.trim() || "(none)",
           ``,
-          `Current conversation summary:`,
-          (convo.summary ?? "").trim() || "(empty)",
-          ``,
-          `Output: the nudge message only`
+          `=== Current conversation summary ===`,
+          (convo.summary ?? "").trim() || "(empty)"
         ].join("\n");
 
+        // The user turn is a minimal trigger. It is never saved to Firestore —
+        // it only exists to satisfy the Gemini API's requirement that `contents`
+        // contains at least one user message.
         const resp = await ai.models.generateContent({
           model: env.GEMINI_TEXT_MODEL,
-          contents: nudgePrompt,
-          config: { safetySettings } as any
+          contents: [{ role: "user", parts: [{ text: "Send the check-in message now." }] }],
+          config: { systemInstruction: nudgeSystemInstruction, safetySettings } as any
         });
 
         const raw =
