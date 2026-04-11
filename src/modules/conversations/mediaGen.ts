@@ -262,13 +262,12 @@ export async function generateConversationVideo(opts: {
     // Extend the existing clip. VEO appends ~7 s of new content to the source
     // clip and returns the full combined video (original + extension).
     console.log("Video generation: extending existing clip, ref uri:", opts.geminiVideoRef!.uri?.slice(0, 80));
+    // Pass only uri — the SDK maps mimeType to `encoding` which the Gemini
+    // Developer API rejects with INVALID_ARGUMENT.
     operation = await ai.models.generateVideos({
       model,
       prompt: opts.prompt,
-      video: {
-        uri: opts.geminiVideoRef!.uri,
-        mimeType: opts.geminiVideoRef!.mimeType ?? "video/mp4"
-      },
+      video: { uri: opts.geminiVideoRef!.uri },
       config
     });
   } else if (opts.useAssistantAvatar && hasAvatar) {
