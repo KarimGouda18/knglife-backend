@@ -267,20 +267,27 @@ export async function generateConversationVideo(opts: {
   });
 
   // safetySettings is NOT part of GenerateVideosConfig — VEO does not accept it.
-  const config: any = { numberOfVideos: 1 };
+  //
+  // Resolution MUST be "720p" for ALL calls (initial generation AND extension).
+  // VEO extension only works when the source clip is 720p; if the original was
+  // generated at a different resolution the API falls back to reference-based
+  // generation (new independent clip) instead of appending to the existing one.
+  const config: any = { numberOfVideos: 1, resolution: "720p", aspectRatio: "16:9" };
   const hasAvatar = !!opts.assistant.avatar?.downloadUrl;
   const isExtension = !!opts.geminiVideoRef?.uri;
 
   let operation: any;
 
   if (isExtension) {
-    // Extend the existing clip. VEO returns a new video that is the full
-    // extended version — the previous clip + the new content. No concatenation needed.
-    console.log("Video generation: extending existing clip");
+    // Extend the existing clip. VEO appends ~7 s of new content to the source
+    // clip and returns the full combined video (original + extension).
+    // Requirements: source must be a Veo-generated 720p clip ≤ 30 s, generated
+    // within the last 48 h.  Pass only uri + mimeType — no extra fields.
+    console.log("Video generation: extending existing clip, ref uri:", opts.geminiVideoRef!.uri?.slice(0, 80));
     operation = await (ai.models.generateVideos as any)({
       model,
       prompt: opts.prompt,
-      video: opts.geminiVideoRef,
+      video: { uri: opts.geminiVideoRef!.uri, mimeType: opts.geminiVideoRef!.mimeType ?? "video/mp4" },
       config
     });
   } else if (opts.useAssistantAvatar && hasAvatar) {
