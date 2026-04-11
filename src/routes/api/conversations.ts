@@ -346,7 +346,7 @@ apiConversationsRouter.post("/:id/generate/video", async (req, res, next) => {
       /** Pass the `geminiVideoRef` from a previous response to extend that clip. */
       geminiVideoRef: z.object({
         uri: z.string().optional(),
-        name: z.string().optional()
+        mimeType: z.string().optional()
       }).optional()
     });
     const input = Body.parse(req.body);
@@ -375,7 +375,7 @@ apiConversationsRouter.post("/:id/generate/video", async (req, res, next) => {
       assistant: { nsfwEnabled: assistant.nsfwEnabled, avatar: assistant.avatar }
     });
 
-    const isExtension = !!input.geminiVideoRef?.uri || !!input.geminiVideoRef?.name;
+    const isExtension = !!input.geminiVideoRef?.uri;
     const description = isExtension
       ? `Extended the video: ${uploadedFile.downloadUrl}`
       : `Generated a video: ${uploadedFile.downloadUrl}`;

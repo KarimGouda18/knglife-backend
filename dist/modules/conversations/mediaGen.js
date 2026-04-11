@@ -184,9 +184,10 @@ export async function generateConversationVideo(opts) {
         userNsfwEnabled: opts.user.nsfwEnabled,
         assistantNsfwEnabled: opts.assistant.nsfwEnabled
     });
-    const config = { safetySettings, numberOfVideos: 1 };
+    // safetySettings is NOT part of GenerateVideosConfig — VEO does not accept it.
+    const config = { numberOfVideos: 1 };
     const hasAvatar = !!opts.assistant.avatar?.downloadUrl;
-    const isExtension = !!opts.geminiVideoRef?.uri || !!opts.geminiVideoRef?.name;
+    const isExtension = !!opts.geminiVideoRef?.uri;
     let operation;
     if (isExtension) {
         // Extend the existing clip. VEO returns a new video that is the full
@@ -219,12 +220,13 @@ export async function generateConversationVideo(opts) {
     const bytes = await downloadVideoRef(videoRef);
     const storagePath = `conversations/${opts.ownerUid}/${opts.conversationId}/videos/${newId()}.mp4`;
     const uploadedFile = await uploadBytesToStorage({ path: storagePath, bytes, contentType: "video/mp4" });
-    // Extract a serialisable reference for the next extension call
+    // Extract a serialisable reference for the next extension call.
+    // Matches the SDK's Video type: { uri?, videoBytes?, mimeType? }.
+    // mimeType is captured so VEO can recognise the format on subsequent extension calls.
     const outRef = {};
     if (videoRef?.uri)
         outRef.uri = videoRef.uri;
-    if (videoRef?.name)
-        outRef.name = videoRef.name;
+    outRef.mimeType = videoRef?.mimeType ?? "video/mp4";
     console.log(`Video generation: done (${bytes.length} bytes), ref:`, outRef);
     return { uploadedFile, geminiVideoRef: outRef };
 }
