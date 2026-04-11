@@ -250,8 +250,15 @@ export async function generateConversationVideo(opts: {
 
   // resolution: "720p" is required for extension to work as a true append
   // (without it the API may use the video as a style reference instead).
+  // personGeneration: "allow_adult" prevents the RAI "third-party content"
+  // guardrail that VEO extension applies when the source clip contains people.
   // SDK ≥1.x supports resolution in the Gemini Developer API (mldev) path.
-  const config: GenerateVideosConfig = { numberOfVideos: 1, resolution: "720p", aspectRatio: "16:9" };
+  const config: GenerateVideosConfig = {
+    numberOfVideos: 1,
+    resolution: "720p",
+    aspectRatio: "16:9",
+    personGeneration: "allow_adult"
+  };
 
   const hasAvatar = !!opts.assistant.avatar?.downloadUrl;
   const isExtension = !!opts.geminiVideoRef?.uri;
