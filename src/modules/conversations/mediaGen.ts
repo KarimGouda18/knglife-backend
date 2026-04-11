@@ -94,6 +94,11 @@ async function downloadGenaiFileToBuffer(opts: { uri?: string; name?: string }):
 
 /**
  * Polls a VEO operation until it completes, then extracts the video reference.
+ *
+ * The Gemini Developer API may return the response in a different shape than
+ * what the SDK TypeScript types describe.  We probe several known paths so that
+ * any format variation is handled gracefully, and we log the raw response to
+ * Cloud Run logs to help diagnose unexpected shapes.
  */
 async function pollVideoOperation(ai: any, operation: any): Promise<any> {
   let op = operation;
@@ -104,8 +109,37 @@ async function pollVideoOperation(ai: any, operation: any): Promise<any> {
   if (op?.error) {
     throw new Error(op.error?.message ?? "VIDEO_OPERATION_FAILED");
   }
-  const videoRef = op?.response?.generatedVideos?.[0]?.video;
-  if (!videoRef) throw new Error("VIDEO_GENERATION_FAILED_NO_VIDEO_REF");
+
+  // Log the full response so we can inspect the real shape in Cloud Run logs.
+  try {
+    console.log("[VEO] operation done, response:", JSON.stringify(op?.response ?? op));
+  } catch { /* non-serialisable — ignore */ }
+
+  // Try every known response shape:
+  //   1. SDK canonical: response.generatedVideos[0].video
+  //   2. Gemini Developer API: response.generateVideoResponse.generatedSamples[0].video
+  //   3. Flat array on response itself: response.videos[0]
+  //   4. Direct on operation root (some SDK versions flatten it): op.generatedVideos[0].video
+  const r: any = op?.response;
+  const videoRef: any =
+    r?.generatedVideos?.[0]?.video ??
+    r?.generateVideoResponse?.generatedSamples?.[0]?.video ??
+    r?.generateVideoResponse?.generatedSamples?.[0] ??
+    r?.videos?.[0]?.video ??
+    r?.videos?.[0] ??
+    op?.generatedVideos?.[0]?.video;
+
+  if (!videoRef) {
+    const filtered: number = r?.raiMediaFilteredCount ?? 0;
+    if (filtered > 0) {
+      const reasons: string = (r?.raiMediaFilteredReasons ?? []).join(", ") || "content policy";
+      throw new Error(`VIDEO_FILTERED_BY_RAI: ${reasons}`);
+    }
+    // Include a snapshot of the response to surface in Sentry / logs.
+    const snapshot = (() => { try { return JSON.stringify(r ?? op); } catch { return "(non-serialisable)"; } })();
+    throw new Error(`VIDEO_GENERATION_FAILED_NO_VIDEO_REF — response: ${snapshot}`);
+  }
+
   return videoRef;
 }
 
