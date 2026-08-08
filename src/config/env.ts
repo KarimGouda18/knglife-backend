@@ -16,7 +16,7 @@ const EnvSchema = z.object({
   // Vertex AI backend (replaces API-key auth; uses ADC via the Cloud Run service account).
   GOOGLE_CLOUD_LOCATION: z.string().min(1).default("us-central1"),
 
-  GEMINI_TEXT_MODEL: z.string().min(1).default("gemini-3.6-flash"),
+  GEMINI_TEXT_MODEL: z.string().min(1).default("gemini-3.5-flash"),
   GEMINI_IMAGE_MODEL: z.string().min(1).default("gemini-3-pro-image-preview"),
   GEMINI_REALTIME_MODEL: z.string().min(1).default("gemini-2.5-flash-native-audio-preview-12-2025"),
   GEMINI_TTS_MODEL: z.string().min(1).default("gemini-2.5-flash-preview-tts"),
