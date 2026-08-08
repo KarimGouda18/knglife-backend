@@ -14,7 +14,9 @@ const EnvSchema = z.object({
   FIREBASE_STORAGE_BUCKET: z.string().min(1),
 
   // Vertex AI backend (replaces API-key auth; uses ADC via the Cloud Run service account).
-  GOOGLE_CLOUD_LOCATION: z.string().min(1).default("us-central1"),
+  // "global" is required here — this project's Vertex AI Gemini access isn't provisioned
+  // for regional endpoints like us-central1 (verified: even older GA models 404 there).
+  GOOGLE_CLOUD_LOCATION: z.string().min(1).default("global"),
 
   GEMINI_TEXT_MODEL: z.string().min(1).default("gemini-3.5-flash"),
   GEMINI_IMAGE_MODEL: z.string().min(1).default("gemini-3-pro-image-preview"),
