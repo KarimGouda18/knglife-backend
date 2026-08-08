@@ -4,11 +4,13 @@ export type PlanId = "base" | "bronze" | "silver" | "gold" | "platinum";
 
 export type PlanLimits = {
   priceEur: number;
-  /** null = unlimited. Never counts the initial voice Interview. */
+  /** null = unlimited. Daily. Never counts the initial voice Interview. */
   callMinutesPerDay: number | null;
-  imagesPerDay: number | null;
-  videosPerDay: number | null;
-  /** Global per-user count across 1:1 chat, group chat and the text Interview. */
+  /** null = unlimited. Resets once per billing period (monthly), not daily. */
+  imagesPerPeriod: number | null;
+  /** null = unlimited. Resets once per billing period (monthly), not daily. */
+  videosPerPeriod: number | null;
+  /** null = unlimited. Daily. Global per-user count across 1:1 chat, group chat and the text Interview. */
   messagesPerDay: number | null;
   groupsEnabled: boolean;
   /** Max assistants per group (members = assistants + the owning user). null = unlimited. */
@@ -22,8 +24,8 @@ export const PLAN_LIMITS: Record<PlanId, PlanLimits> = {
   base: {
     priceEur: 0,
     callMinutesPerDay: 5,
-    imagesPerDay: 10,
-    videosPerDay: 3,
+    imagesPerPeriod: 10,
+    videosPerPeriod: 3,
     messagesPerDay: 100,
     groupsEnabled: false,
     groupMaxAssistants: 0,
@@ -33,8 +35,8 @@ export const PLAN_LIMITS: Record<PlanId, PlanLimits> = {
   bronze: {
     priceEur: 9.99,
     callMinutesPerDay: 15,
-    imagesPerDay: 20,
-    videosPerDay: 6,
+    imagesPerPeriod: 20,
+    videosPerPeriod: 6,
     messagesPerDay: 500,
     groupsEnabled: true,
     groupMaxAssistants: 2,
@@ -44,8 +46,8 @@ export const PLAN_LIMITS: Record<PlanId, PlanLimits> = {
   silver: {
     priceEur: 19.99,
     callMinutesPerDay: 30,
-    imagesPerDay: 60,
-    videosPerDay: 12,
+    imagesPerPeriod: 60,
+    videosPerPeriod: 12,
     messagesPerDay: 1500,
     groupsEnabled: true,
     groupMaxAssistants: 9,
@@ -55,8 +57,8 @@ export const PLAN_LIMITS: Record<PlanId, PlanLimits> = {
   gold: {
     priceEur: 34.99,
     callMinutesPerDay: 60,
-    imagesPerDay: 90,
-    videosPerDay: 20,
+    imagesPerPeriod: 90,
+    videosPerPeriod: 20,
     messagesPerDay: 3000,
     groupsEnabled: true,
     groupMaxAssistants: 19,
@@ -66,8 +68,8 @@ export const PLAN_LIMITS: Record<PlanId, PlanLimits> = {
   platinum: {
     priceEur: 99.99,
     callMinutesPerDay: null,
-    imagesPerDay: null,
-    videosPerDay: null,
+    imagesPerPeriod: null,
+    videosPerPeriod: null,
     messagesPerDay: null,
     groupsEnabled: true,
     groupMaxAssistants: null,

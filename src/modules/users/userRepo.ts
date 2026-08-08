@@ -1,6 +1,7 @@
 // src/modules/users/userRepo.ts
 import type { Firestore } from "firebase-admin/firestore";
 import { computeAgeFromBirthDate } from "../../shared/utils/safety.js";
+import { addMonthsIso } from "../../shared/utils/period.js";
 import type { PlanId } from "../../config/plans.js";
 
 export type VisualDisabilityLevel = "none" | "low_vision" | "blind" | "other";
@@ -27,7 +28,16 @@ export type UserProfile = {
 
   /** Subscription tier. Defaults to "base" (free). */
   plan: PlanId;
+  /** Last time the plan itself was changed (activation/upgrade/downgrade). */
   planUpdatedAt: string | null;
+  /** Start of the current billing period (ISO). Images/videos quotas reset once per period, not daily. */
+  planPeriodStart: string;
+  /** End of the current billing period / next renewal date (ISO). */
+  planRenewsAt: string;
+  /** If true, the plan reverts to "base" at planRenewsAt instead of renewing. */
+  planCancelAtPeriodEnd: boolean;
+  imagesUsedInPeriod: number;
+  videosUsedInPeriod: number;
 
   /** ISO timestamp updated by the client heartbeat. Used by the nudge system to detect real inactivity. */
   lastActiveAt?: string | null;
@@ -106,6 +116,11 @@ export async function getOrCreateUserProfile(db: Firestore, uid: string, email: 
 
     plan: "base",
     planUpdatedAt: null,
+    planPeriodStart: nowIso(),
+    planRenewsAt: addMonthsIso(nowIso(), 1),
+    planCancelAtPeriodEnd: false,
+    imagesUsedInPeriod: 0,
+    videosUsedInPeriod: 0,
 
     createdAt: nowIso(),
     updatedAt: nowIso()

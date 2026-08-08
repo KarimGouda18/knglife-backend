@@ -24,8 +24,7 @@ import { buildAssistantRecallContext } from "../modules/conversations/recall.js"
 import { updateConversationSummary } from "../modules/conversations/updateSummary.js";
 import { generateConversationTitle } from "../modules/conversations/generateTitle.js";
 import { upsertAssistantMemory } from "../modules/assistants/assistantMemory.js";
-import { effectivePlan } from "../modules/users/userRepo.js";
-import { remainingCallSeconds, incrementUsageBestEffort } from "../modules/usage/usageRepo.js";
+import { remainingCallSeconds, incrementUsageBestEffort, ensurePlanPeriod } from "../modules/usage/usageRepo.js";
 
 /**
  * WebSocket protocol — client → server:
@@ -659,7 +658,7 @@ export function attachLiveWebSocketServer(server: http.Server) {
       // Call-minute quota (daily, plan-based). The Interview voice session is always excluded.
       let remainingSeconds: number | null = null;
       if (!isInterview) {
-        remainingSeconds = await remainingCallSeconds(db, authUser.uid, effectivePlan(userProfile));
+        remainingSeconds = await remainingCallSeconds(db, authUser.uid, (await ensurePlanPeriod(db, authUser.uid)).plan);
         if (remainingSeconds !== null && remainingSeconds <= 0) {
           wsSend(ws, { type: "error", error: "LIMIT_REACHED", details: { limit: "callMinutes" } });
           ws.close(1013, "Daily call-minute quota reached");
@@ -777,7 +776,7 @@ export function attachLiveWebSocketServer(server: http.Server) {
             try {
               if (!isInterview) {
                 const elapsedSeconds = Math.round((Date.now() - callStartedAt) / 1000);
-                await incrementUsageBestEffort(db, authUser.uid, "callMinutes", elapsedSeconds);
+                await incrementUsageBestEffort(db, authUser.uid, elapsedSeconds);
               }
             } catch {}
             try {

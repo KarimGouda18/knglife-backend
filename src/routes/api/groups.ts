@@ -16,8 +16,8 @@ import {
   updateGroup,
   type GroupDoc
 } from "../../modules/groups/groupsRepo.js";
-import { effectivePlan } from "../../modules/users/userRepo.js";
-import { planLimits } from "../../config/plans.js";
+import { ensurePlanPeriod } from "../../modules/usage/usageRepo.js";
+import { planLimits, type PlanId } from "../../config/plans.js";
 
 export const apiGroupsRouter = Router();
 apiGroupsRouter.use(requireAuth);
@@ -42,7 +42,7 @@ const PatchSchema = z.object({
 });
 
 /** Throws 403 if the plan doesn't allow groups at all, or 402 if assistantIds exceeds the plan's cap. */
-function assertGroupSizeAllowed(plan: ReturnType<typeof effectivePlan>, assistantIdsCount: number) {
+function assertGroupSizeAllowed(plan: PlanId, assistantIdsCount: number) {
   const limits = planLimits(plan);
   if (!limits.groupsEnabled) {
     const err: any = new Error("Group chats are not available on this plan.");
@@ -76,7 +76,7 @@ apiGroupsRouter.post("/", async (req, res, next) => {
     const db = getFirestore();
 
     const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
-    assertGroupSizeAllowed(effectivePlan(userProfile), input.assistantIds.length);
+    assertGroupSizeAllowed((await ensurePlanPeriod(db, req.user!.uid)).plan, input.assistantIds.length);
 
     // valida assistenti e ownership
     const assistants = await resolveGroupAssistants({
@@ -141,7 +141,7 @@ apiGroupsRouter.put("/:id", async (req, res, next) => {
       nextAssistantIds = Array.from(new Set(patch.assistantIds));
 
       const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
-      assertGroupSizeAllowed(effectivePlan(userProfile), nextAssistantIds.length);
+      assertGroupSizeAllowed((await ensurePlanPeriod(db, req.user!.uid)).plan, nextAssistantIds.length);
 
       const assistants = await resolveGroupAssistants({
         db,

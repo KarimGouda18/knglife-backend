@@ -14,9 +14,8 @@ import { getGenAI } from "../../config/genai.js";
 import { getGeminiSafetySettings } from "../../shared/utils/safety.js";
 import { sanitizeForJson } from "../../shared/utils/text.js";
 import { sanitizeDeep } from "../../shared/utils/sanitizeDeep.js";
-import { effectivePlan } from "../../modules/users/userRepo.js";
 import { planLimits } from "../../config/plans.js";
-import { getUsageToday } from "../../modules/usage/usageRepo.js";
+import { getUsageToday, ensurePlanPeriod } from "../../modules/usage/usageRepo.js";
 
 /**
  * Nudge (proactive message) endpoints:
@@ -52,8 +51,7 @@ apiNudgesRouter.put("/assistants/:id", requireAuth, async (req, res, next) => {
     }
 
     if (input.enabled && !a.nudge?.enabled) {
-      const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
-      const plan = effectivePlan(userProfile);
+      const plan = (await ensurePlanPeriod(db, req.user!.uid)).plan;
       const maxNudges = planLimits(plan).nudgesMaxAssistants;
 
       if (maxNudges !== null) {
@@ -169,8 +167,9 @@ apiNudgesRouter.post("/tick", async (req, res, next) => {
         if (lastNudgeAt && now - lastNudgeAt < everyMs) continue;
 
         // Nudges pause once the user's daily message quota is already exhausted —
-        // sending one would itself be an over-quota message.
-        const plan = effectivePlan(userProfile);
+        // sending one would itself be an over-quota message. Also re-resolves the
+        // plan so an expired/cancelled subscription stops nudges immediately.
+        const plan = (await ensurePlanPeriod(db, ownerUid)).plan;
         const messagesLimit = planLimits(plan).messagesPerDay;
         if (messagesLimit !== null) {
           const usageToday = await getUsageToday(db, ownerUid);

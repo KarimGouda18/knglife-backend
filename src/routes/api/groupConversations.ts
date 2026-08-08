@@ -20,8 +20,7 @@ import {
   listOwnerGroupConversations,
   newId
 } from "../../modules/groupConversations/groupConversationsRepo.js";
-import { effectivePlan } from "../../modules/users/userRepo.js";
-import { checkAndIncrement } from "../../modules/usage/usageRepo.js";
+import { checkAndIncrement, ensurePlanPeriod } from "../../modules/usage/usageRepo.js";
 import { PlanFeatureLockedError } from "../../shared/errors/limitExceeded.js";
 import { planLimits } from "../../config/plans.js";
 
@@ -185,7 +184,7 @@ apiGroupConversationsRouter.post("/:id/message", async (req, res, next) => {
     }
 
     const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
-    const plan = effectivePlan(userProfile);
+    const plan = (await ensurePlanPeriod(db, req.user!.uid)).plan;
 
     const hasVoicePart = parts.some(
       (p) => (p.type === "inline_data" || p.type === "file_url") && p.mimeType.startsWith("audio/")
@@ -198,7 +197,7 @@ apiGroupConversationsRouter.post("/:id/message", async (req, res, next) => {
       );
     }
 
-    await checkAndIncrement(db, req.user!.uid, plan, "messages");
+    await checkAndIncrement(db, req.user!.uid, plan);
 
     const assistants = await resolveGroupAssistants({
       db,

@@ -24,8 +24,7 @@ import { buildAssistantRecallContext } from "../../modules/conversations/recall.
 import { generateConversationTitle } from "../../modules/conversations/generateTitle.js";
 import { updateConversationSummary } from "../../modules/conversations/updateSummary.js";
 import { upsertAssistantMemory } from "../../modules/assistants/assistantMemory.js";
-import { effectivePlan } from "../../modules/users/userRepo.js";
-import { checkAndIncrement } from "../../modules/usage/usageRepo.js";
+import { checkAndIncrement, checkAndIncrementPeriodMetric, ensurePlanPeriod } from "../../modules/usage/usageRepo.js";
 import { PlanFeatureLockedError } from "../../shared/errors/limitExceeded.js";
 import { planLimits } from "../../config/plans.js";
 
@@ -193,7 +192,7 @@ apiConversationsRouter.post("/:id/message", async (req, res, next) => {
     }
 
     const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
-    const plan = effectivePlan(userProfile);
+    const plan = (await ensurePlanPeriod(db, req.user!.uid)).plan;
 
     const hasVoicePart = parts.some(
       (p) => (p.type === "inline_data" || p.type === "file_url") && p.mimeType.startsWith("audio/")
@@ -206,7 +205,7 @@ apiConversationsRouter.post("/:id/message", async (req, res, next) => {
       );
     }
 
-    await checkAndIncrement(db, req.user!.uid, plan, "messages");
+    await checkAndIncrement(db, req.user!.uid, plan);
 
     const userMsgText = parts
       .map((p) => {
@@ -334,7 +333,7 @@ apiConversationsRouter.post("/:id/generate/image", async (req, res, next) => {
     }
 
     const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
-    await checkAndIncrement(db, req.user!.uid, effectivePlan(userProfile), "images");
+    await checkAndIncrementPeriodMetric(db, req.user!.uid, "images");
 
     const media = await generateConversationImage({
       ownerUid: req.user!.uid,
@@ -390,7 +389,7 @@ apiConversationsRouter.post("/:id/generate/video", async (req, res, next) => {
     }
 
     const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
-    await checkAndIncrement(db, req.user!.uid, effectivePlan(userProfile), "videos");
+    await checkAndIncrementPeriodMetric(db, req.user!.uid, "videos");
 
     const { uploadedFile, geminiVideoRef } = await generateConversationVideo({
       ownerUid: req.user!.uid,
