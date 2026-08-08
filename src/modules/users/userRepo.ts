@@ -1,6 +1,7 @@
 // src/modules/users/userRepo.ts
 import type { Firestore } from "firebase-admin/firestore";
 import { computeAgeFromBirthDate } from "../../shared/utils/safety.js";
+import type { PlanId } from "../../config/plans.js";
 
 export type VisualDisabilityLevel = "none" | "low_vision" | "blind" | "other";
 
@@ -23,6 +24,10 @@ export type UserProfile = {
   nsfwEnabled: boolean;
 
   onboardingCompleted: boolean;
+
+  /** Subscription tier. Defaults to "base" (free). */
+  plan: PlanId;
+  planUpdatedAt: string | null;
 
   /** ISO timestamp updated by the client heartbeat. Used by the nudge system to detect real inactivity. */
   lastActiveAt?: string | null;
@@ -99,12 +104,20 @@ export async function getOrCreateUserProfile(db: Firestore, uid: string, email: 
     nsfwEnabled: false,
     onboardingCompleted: false,
 
+    plan: "base",
+    planUpdatedAt: null,
+
     createdAt: nowIso(),
     updatedAt: nowIso()
   };
 
   await ref.set(created, { merge: false });
   return created;
+}
+
+/** Returns the user's plan, defaulting to "base" for profiles created before the plan field existed. */
+export function effectivePlan(p: Pick<UserProfile, "plan">): PlanId {
+  return p.plan ?? "base";
 }
 
 export async function updateUserProfile(db: Firestore, uid: string, patch: Partial<UserProfile>): Promise<UserProfile> {

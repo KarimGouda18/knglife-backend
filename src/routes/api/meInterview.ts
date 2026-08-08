@@ -13,6 +13,8 @@ import {
 } from "../../modules/interview/interviewRepo.js";
 import { generateInterviewSummaryBio, generateNextInterviewQuestion } from "../../modules/interview/runInterview.js";
 import { sanitizeDeep } from "../../shared/utils/sanitizeDeep.js";
+import { effectivePlan } from "../../modules/users/userRepo.js";
+import { checkAndIncrement } from "../../modules/usage/usageRepo.js";
 
 export const apiMeInterviewRouter = Router();
 apiMeInterviewRouter.use(requireAuth);
@@ -85,6 +87,7 @@ apiMeInterviewRouter.post("/:interviewId/message", async (req, res, next) => {
     if (interview.status !== "active") return res.status(409).json({ ok: false, error: "INTERVIEW_NOT_ACTIVE" });
 
     const user = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
+    await checkAndIncrement(db, req.user!.uid, effectivePlan(user), "messages");
 
     const userMsg = await addInterviewMessage(db, req.user!.uid, interview.id, { role: "user", text });
 

@@ -1,5 +1,6 @@
 // src/modules/conversations/mediaGen.ts
 import crypto from "node:crypto";
+import { GoogleAuth } from "google-auth-library";
 import { env } from "../../config/env.js";
 import { getGenAI } from "../../config/genai.js";
 import { getGeminiSafetySettings } from "../../shared/utils/safety.js";
@@ -8,6 +9,22 @@ import type { UserProfile } from "../users/userRepo.js";
 import type { AssistantDoc } from "../assistants/assistantsRepo.js";
 import { promises as fs } from "node:fs";
 import type { GenerateVideosOperation, GenerateVideosConfig, Video } from "@google/genai";
+
+let googleAuth: GoogleAuth | null = null;
+
+/** Lazily-initialized ADC client used to fetch OAuth2 access tokens for Vertex AI. */
+function getGoogleAuth() {
+  if (googleAuth) return googleAuth;
+  googleAuth = new GoogleAuth({ scopes: ["https://www.googleapis.com/auth/cloud-platform"] });
+  return googleAuth;
+}
+
+async function getVertexAccessToken(): Promise<string> {
+  const client = await getGoogleAuth().getClient();
+  const { token } = await client.getAccessToken();
+  if (!token) throw new Error("VERTEX_ACCESS_TOKEN_UNAVAILABLE");
+  return token;
+}
 
 // ---------------------------------------------------------------------------
 // Internal utilities
@@ -51,11 +68,12 @@ function extractFilesNameFromUri(uri: string): string | null {
 }
 
 /**
- * Downloads a video by URI using the Gemini API key.
+ * Downloads a video by URI, authenticating via ADC (Vertex AI OAuth2 bearer token).
  */
 async function fetchVideoByUri(uri: string): Promise<Buffer> {
+  const token = await getVertexAccessToken();
   const res = await fetch(uri, {
-    headers: { "x-goog-api-key": env.GEMINI_API_KEY }
+    headers: { Authorization: `Bearer ${token}` }
   });
   if (!res.ok) throw new Error(`VIDEO_DOWNLOAD_FAILED_FETCH: ${res.status} ${res.statusText}`);
   const ab = await res.arrayBuffer();

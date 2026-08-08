@@ -68,7 +68,7 @@ export async function generateNextInterviewQuestion(opts: {
     `Trascrizione finora:`,
     history || "(vuota)",
     ``,
-    `Ora scrivi la PROSSIMA domanda. Output: solo la domanda, niente prefazioni.`
+    `Continua la conversazione in modo naturale e caloroso, poi poni la PROSSIMA domanda.`
   ].join("\n");
 
   const resp = await ai.models.generateContent({

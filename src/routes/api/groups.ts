@@ -16,6 +16,8 @@ import {
   updateGroup,
   type GroupDoc
 } from "../../modules/groups/groupsRepo.js";
+import { effectivePlan } from "../../modules/users/userRepo.js";
+import { planLimits } from "../../config/plans.js";
 
 export const apiGroupsRouter = Router();
 apiGroupsRouter.use(requireAuth);
@@ -30,14 +32,33 @@ function userAllowsAnyAssistantNsfw(user: { birthDate: string | null; nsfwEnable
 const BodySchema = z.object({
   name: z.string().min(1).max(80),
   context: z.string().max(4000).optional(),
-  assistantIds: z.array(z.string().min(1)).min(1).max(20)
+  assistantIds: z.array(z.string().min(1)).min(1)
 });
 
 const PatchSchema = z.object({
   name: z.string().min(1).max(80).optional(),
   context: z.string().max(4000).nullable().optional(),
-  assistantIds: z.array(z.string().min(1)).min(1).max(20).optional()
+  assistantIds: z.array(z.string().min(1)).min(1).optional()
 });
+
+/** Throws 403 if the plan doesn't allow groups at all, or 402 if assistantIds exceeds the plan's cap. */
+function assertGroupSizeAllowed(plan: ReturnType<typeof effectivePlan>, assistantIdsCount: number) {
+  const limits = planLimits(plan);
+  if (!limits.groupsEnabled) {
+    const err: any = new Error("Group chats are not available on this plan.");
+    err.statusCode = 403;
+    err.code = "GROUPS_NOT_AVAILABLE";
+    err.details = { plan };
+    throw err;
+  }
+  if (limits.groupMaxAssistants !== null && assistantIdsCount > limits.groupMaxAssistants) {
+    const err: any = new Error("Group size exceeds this plan's limit.");
+    err.statusCode = 402;
+    err.code = "LIMIT_REACHED";
+    err.details = { limit: "groupSize", plan };
+    throw err;
+  }
+}
 
 apiGroupsRouter.get("/", async (req, res, next) => {
   try {
@@ -54,6 +75,9 @@ apiGroupsRouter.post("/", async (req, res, next) => {
     const input = BodySchema.parse(req.body);
     const db = getFirestore();
 
+    const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
+    assertGroupSizeAllowed(effectivePlan(userProfile), input.assistantIds.length);
+
     // valida assistenti e ownership
     const assistants = await resolveGroupAssistants({
       db,
@@ -62,7 +86,6 @@ apiGroupsRouter.post("/", async (req, res, next) => {
     });
 
     // gating NSFW: se nel gruppo c'è almeno un assistente nsfw
-    const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
     const anyNsfw = assistants.some((a) => a.nsfwEnabled);
 
     if (!userAllowsAnyAssistantNsfw(userProfile, anyNsfw)) {
@@ -116,13 +139,16 @@ apiGroupsRouter.put("/:id", async (req, res, next) => {
     let nextAssistantIds = existing.assistantIds;
     if (patch.assistantIds) {
       nextAssistantIds = Array.from(new Set(patch.assistantIds));
+
+      const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
+      assertGroupSizeAllowed(effectivePlan(userProfile), nextAssistantIds.length);
+
       const assistants = await resolveGroupAssistants({
         db,
         ownerUid: req.user!.uid,
         assistantIds: nextAssistantIds
       });
 
-      const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
       const anyNsfw = assistants.some((a) => a.nsfwEnabled);
 
       if (!userAllowsAnyAssistantNsfw(userProfile, anyNsfw)) {

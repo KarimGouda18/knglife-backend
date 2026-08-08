@@ -6,6 +6,10 @@ let client: GoogleGenAI | null = null;
 
 export function getGenAI() {
   if (client) return client;
-  client = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
+  client = new GoogleGenAI({
+    vertexai: true,
+    project: env.GCP_PROJECT_ID,
+    location: env.GOOGLE_CLOUD_LOCATION
+  });
   return client;
 }

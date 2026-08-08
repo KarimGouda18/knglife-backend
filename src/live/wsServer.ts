@@ -24,6 +24,8 @@ import { buildAssistantRecallContext } from "../modules/conversations/recall.js"
 import { updateConversationSummary } from "../modules/conversations/updateSummary.js";
 import { generateConversationTitle } from "../modules/conversations/generateTitle.js";
 import { upsertAssistantMemory } from "../modules/assistants/assistantMemory.js";
+import { effectivePlan } from "../modules/users/userRepo.js";
+import { remainingCallSeconds, incrementUsageBestEffort } from "../modules/usage/usageRepo.js";
 
 /**
  * WebSocket protocol — client → server:
@@ -654,6 +656,21 @@ export function attachLiveWebSocketServer(server: http.Server) {
 
       const tools = [{ googleSearch: {} }];
 
+      // Call-minute quota (daily, plan-based). The Interview voice session is always excluded.
+      let remainingSeconds: number | null = null;
+      if (!isInterview) {
+        remainingSeconds = await remainingCallSeconds(db, authUser.uid, effectivePlan(userProfile));
+        if (remainingSeconds !== null && remainingSeconds <= 0) {
+          wsSend(ws, { type: "error", error: "LIMIT_REACHED", details: { limit: "callMinutes" } });
+          ws.close(1013, "Daily call-minute quota reached");
+          clearInterval(pingInterval);
+          return;
+        }
+      }
+
+      const callStartedAt = Date.now();
+      let quotaCloseTimer: NodeJS.Timeout | null = null;
+
       const session = await ai.live.connect({
         model: env.GEMINI_REALTIME_MODEL,
         config: {
@@ -749,10 +766,19 @@ export function attachLiveWebSocketServer(server: http.Server) {
           },
           onclose: async () => {
             try {
+              if (quotaCloseTimer) clearTimeout(quotaCloseTimer);
+            } catch {}
+            try {
               if (isInterview && transcriptSaver) await transcriptSaver.flushAll();
             } catch {}
             try {
               if (!isInterview && liveSaver) await liveSaver.flushAll();
+            } catch {}
+            try {
+              if (!isInterview) {
+                const elapsedSeconds = Math.round((Date.now() - callStartedAt) / 1000);
+                await incrementUsageBestEffort(db, authUser.uid, "callMinutes", elapsedSeconds);
+              }
             } catch {}
             try {
               ws.close(1000, "Live session closed");
@@ -760,6 +786,15 @@ export function attachLiveWebSocketServer(server: http.Server) {
           }
         }
       });
+
+      if (!isInterview && remainingSeconds !== null) {
+        quotaCloseTimer = setTimeout(() => {
+          try {
+            wsSend(ws, { type: "error", error: "LIMIT_REACHED", details: { limit: "callMinutes" } });
+            void session.close();
+          } catch {}
+        }, remainingSeconds * 1000);
+      }
 
       ws.on("message", async (buf) => {
         const s = typeof buf === "string" ? buf : buf.toString("utf8");

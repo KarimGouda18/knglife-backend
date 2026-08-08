@@ -38,45 +38,42 @@ function userAllowsAssistantNsfw(user: { birthDate: string | null; nsfwEnabled: 
 }
 
 const AvatarSpecSchema = z.object({
-  ethnicity: z.string().min(1).max(50),
+  ethnicity: z.string().min(1),
   heightCm: z.number().int().min(80).max(230),
-  bodyType: z.string().min(1).max(50),
-  hairStyle: z.string().min(1).max(60),
-  hairColor: z.string().min(1).max(40),
-  eyeColor: z.string().min(1).max(40),
-  clothingStyle: z.string().min(1).max(80)
+  bodyType: z.string().min(1),
+  hairStyle: z.string().min(1),
+  hairColor: z.string().min(1),
+  eyeColor: z.string().min(1),
+  clothingStyle: z.string().min(1)
 });
 
 const VoiceNameSchema = z
   .string()
   .min(1)
-  .max(40)
   .transform((s) => s.trim())
   .default("Kore");
 
-const OptionalStr = (max = 2000) =>
+const OptionalStr = () =>
   z
     .string()
-    .max(max)
     .optional()
-    .transform((s) => (typeof s === "string" ? s.trim() : s))
-    .refine((s) => s === undefined || s.length <= max, "STRING_TOO_LONG");
+    .transform((s) => (typeof s === "string" ? s.trim() : s));
 
 const PersonaSchema = z
   .object({
-    personality: OptionalStr(2000),
-    profession: OptionalStr(2000),
-    identityType: OptionalStr(200),
-    sourceMaterial: OptionalStr(400),
-    backstory: OptionalStr(4000),
-    traits: OptionalStr(2000),
-    interests: OptionalStr(2000),
-    values: OptionalStr(2000),
-    speakingStyle: OptionalStr(2000),
-    goals: OptionalStr(2000),
-    familyNotes: OptionalStr(2000),
-    location: OptionalStr(2000),
-    otherNotes: OptionalStr(4000)
+    personality: OptionalStr(),
+    profession: OptionalStr(),
+    identityType: OptionalStr(),
+    sourceMaterial: OptionalStr(),
+    backstory: OptionalStr(),
+    traits: OptionalStr(),
+    interests: OptionalStr(),
+    values: OptionalStr(),
+    speakingStyle: OptionalStr(),
+    goals: OptionalStr(),
+    familyNotes: OptionalStr(),
+    location: OptionalStr(),
+    otherNotes: OptionalStr()
   })
   .partial()
   .optional();
@@ -112,14 +109,14 @@ apiAssistantsRouter.get("/", async (req, res, next) => {
 apiAssistantsRouter.post("/", async (req, res, next) => {
   try {
     const Body = z.object({
-      name: z.string().min(1).max(80),
-      surname: z.string().min(1).max(80),
+      name: z.string().min(1),
+      surname: z.string().min(1),
       age: z.number().int().min(0).max(120),
-      gender: z.string().min(1).max(40),
-      relationship: z.string().min(1).max(120),
+      gender: z.string().min(1),
+      relationship: z.string().min(1),
 
       bioMode: z.enum(["manual", "auto"]).default("auto"),
-      bio: z.string().max(8000).optional(),
+      bio: z.string().optional(),
 
       avatarSpec: AvatarSpecSchema,
 
@@ -245,20 +242,20 @@ apiAssistantsRouter.get("/:id", async (req, res, next) => {
 apiAssistantsRouter.put("/:id", async (req, res, next) => {
   try {
     const Body = z.object({
-      name: z.string().min(1).max(80).optional(),
-      surname: z.string().min(1).max(80).optional(),
+      name: z.string().min(1).optional(),
+      surname: z.string().min(1).optional(),
       age: z.number().int().min(0).max(120).optional(),
-      gender: z.string().min(1).max(40).optional(),
-      relationship: z.string().min(1).max(120).optional(),
+      gender: z.string().min(1).optional(),
+      relationship: z.string().min(1).optional(),
 
-      bio: z.string().max(8000).optional(),
+      bio: z.string().optional(),
       bioMode: z.enum(["manual", "auto"]).optional(),
 
       avatarSpec: AvatarSpecSchema.optional(),
 
       nsfwEnabled: z.boolean().optional(),
 
-      voiceName: z.string().min(1).max(40).optional(),
+      voiceName: z.string().min(1).optional(),
 
       persona: PersonaSchema,
 

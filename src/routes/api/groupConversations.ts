@@ -20,6 +20,10 @@ import {
   listOwnerGroupConversations,
   newId
 } from "../../modules/groupConversations/groupConversationsRepo.js";
+import { effectivePlan } from "../../modules/users/userRepo.js";
+import { checkAndIncrement } from "../../modules/usage/usageRepo.js";
+import { PlanFeatureLockedError } from "../../shared/errors/limitExceeded.js";
+import { planLimits } from "../../config/plans.js";
 
 export const apiGroupConversationsRouter = Router();
 apiGroupConversationsRouter.use(requireAuth);
@@ -181,6 +185,20 @@ apiGroupConversationsRouter.post("/:id/message", async (req, res, next) => {
     }
 
     const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
+    const plan = effectivePlan(userProfile);
+
+    const hasVoicePart = parts.some(
+      (p) => (p.type === "inline_data" || p.type === "file_url") && p.mimeType.startsWith("audio/")
+    );
+    if (hasVoicePart && !planLimits(plan).voiceMessagesAllowed) {
+      throw new PlanFeatureLockedError(
+        "VOICE_MESSAGES_NOT_ALLOWED",
+        "Voice messages are not available on this plan.",
+        plan
+      );
+    }
+
+    await checkAndIncrement(db, req.user!.uid, plan, "messages");
 
     const assistants = await resolveGroupAssistants({
       db,

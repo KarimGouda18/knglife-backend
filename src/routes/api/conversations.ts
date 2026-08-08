@@ -24,6 +24,10 @@ import { buildAssistantRecallContext } from "../../modules/conversations/recall.
 import { generateConversationTitle } from "../../modules/conversations/generateTitle.js";
 import { updateConversationSummary } from "../../modules/conversations/updateSummary.js";
 import { upsertAssistantMemory } from "../../modules/assistants/assistantMemory.js";
+import { effectivePlan } from "../../modules/users/userRepo.js";
+import { checkAndIncrement } from "../../modules/usage/usageRepo.js";
+import { PlanFeatureLockedError } from "../../shared/errors/limitExceeded.js";
+import { planLimits } from "../../config/plans.js";
 
 export const apiConversationsRouter = Router();
 apiConversationsRouter.use(requireAuth);
@@ -189,6 +193,20 @@ apiConversationsRouter.post("/:id/message", async (req, res, next) => {
     }
 
     const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
+    const plan = effectivePlan(userProfile);
+
+    const hasVoicePart = parts.some(
+      (p) => (p.type === "inline_data" || p.type === "file_url") && p.mimeType.startsWith("audio/")
+    );
+    if (hasVoicePart && !planLimits(plan).voiceMessagesAllowed) {
+      throw new PlanFeatureLockedError(
+        "VOICE_MESSAGES_NOT_ALLOWED",
+        "Voice messages are not available on this plan.",
+        plan
+      );
+    }
+
+    await checkAndIncrement(db, req.user!.uid, plan, "messages");
 
     const userMsgText = parts
       .map((p) => {
@@ -316,6 +334,7 @@ apiConversationsRouter.post("/:id/generate/image", async (req, res, next) => {
     }
 
     const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
+    await checkAndIncrement(db, req.user!.uid, effectivePlan(userProfile), "images");
 
     const media = await generateConversationImage({
       ownerUid: req.user!.uid,
@@ -371,6 +390,7 @@ apiConversationsRouter.post("/:id/generate/video", async (req, res, next) => {
     }
 
     const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
+    await checkAndIncrement(db, req.user!.uid, effectivePlan(userProfile), "videos");
 
     const { uploadedFile, geminiVideoRef } = await generateConversationVideo({
       ownerUid: req.user!.uid,

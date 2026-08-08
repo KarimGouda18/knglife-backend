@@ -14,6 +14,9 @@ import { getGenAI } from "../../config/genai.js";
 import { getGeminiSafetySettings } from "../../shared/utils/safety.js";
 import { sanitizeForJson } from "../../shared/utils/text.js";
 import { sanitizeDeep } from "../../shared/utils/sanitizeDeep.js";
+import { effectivePlan } from "../../modules/users/userRepo.js";
+import { planLimits } from "../../config/plans.js";
+import { getUsageToday } from "../../modules/usage/usageRepo.js";
 
 /**
  * Nudge (proactive message) endpoints:
@@ -46,6 +49,25 @@ apiNudgesRouter.put("/assistants/:id", requireAuth, async (req, res, next) => {
     const a = await getAssistant(db, req.params.id);
     if (!a || a.ownerUid !== req.user!.uid) {
       return res.status(404).json({ ok: false, error: "ASSISTANT_NOT_FOUND" });
+    }
+
+    if (input.enabled && !a.nudge?.enabled) {
+      const userProfile = await getOrCreateUserProfile(db, req.user!.uid, req.user!.email ?? null);
+      const plan = effectivePlan(userProfile);
+      const maxNudges = planLimits(plan).nudgesMaxAssistants;
+
+      if (maxNudges !== null) {
+        const owned = await listOwnerAssistants(db, req.user!.uid, 500);
+        const enabledCount = owned.filter((x) => x.nudge?.enabled === true).length;
+        if (enabledCount >= maxNudges) {
+          return res.status(403).json({
+            ok: false,
+            error: "NUDGES_LIMIT_REACHED",
+            code: "NUDGES_LIMIT_REACHED",
+            details: { plan, limit: maxNudges }
+          });
+        }
+      }
     }
 
     const nudge = {
@@ -145,6 +167,15 @@ apiNudgesRouter.post("/tick", async (req, res, next) => {
         const lastNudgeAt = n.lastNudgeAt ? Date.parse(n.lastNudgeAt) : 0;
         const everyMs = Number(n.everyMinutes) * 60_000;
         if (lastNudgeAt && now - lastNudgeAt < everyMs) continue;
+
+        // Nudges pause once the user's daily message quota is already exhausted —
+        // sending one would itself be an over-quota message.
+        const plan = effectivePlan(userProfile);
+        const messagesLimit = planLimits(plan).messagesPerDay;
+        if (messagesLimit !== null) {
+          const usageToday = await getUsageToday(db, ownerUid);
+          if (usageToday.messages >= messagesLimit) continue;
+        }
 
         const { assistantMemory, recallText } = await buildAssistantRecallContext({
           db,

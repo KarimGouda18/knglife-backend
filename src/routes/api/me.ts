@@ -6,6 +6,7 @@ import { getFirestore, getStorage } from "../../config/firebase.js";
 import { getOrCreateUserProfile, isProfileCompleted, updateUserProfile } from "../../modules/users/userRepo.js";
 import { computeAgeFromBirthDate } from "../../shared/utils/safety.js";
 import { apiMeInterviewRouter } from "./meInterview.js";
+import { apiSubscriptionRouter } from "./subscription.js";
 import { sanitizeDeep } from "../../shared/utils/sanitizeDeep.js";
 import { deleteAccountEverywhere } from "../../modules/users/deleteAccount.js";
 
@@ -114,3 +115,6 @@ apiMeRouter.delete("/", async (req, res, next) => {
 
 // Mount interview sotto /api/me/interview/*
 apiMeRouter.use("/interview", apiMeInterviewRouter);
+
+// Mount subscription sotto /api/me/subscription
+apiMeRouter.use("/subscription", apiSubscriptionRouter);
