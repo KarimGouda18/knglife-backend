@@ -14,14 +14,21 @@ const EnvSchema = z.object({
   FIREBASE_STORAGE_BUCKET: z.string().min(1),
 
   // Vertex AI backend (replaces API-key auth; uses ADC via the Cloud Run service account).
-  // "global" is required here — this project's Vertex AI Gemini access isn't provisioned
-  // for regional endpoints like us-central1 (verified: even older GA models 404 there).
+  // "global" is the endpoint the newest Gemini models (3.x, TTS 3.1) are actually served
+  // on for this project — verified directly against the API; regional endpoints
+  // (us-central1 etc.) 404 for these even though they work for some older models.
   GOOGLE_CLOUD_LOCATION: z.string().min(1).default("global"),
 
-  GEMINI_TEXT_MODEL: z.string().min(1).default("gemini-3.5-flash"),
+  // Latest models confirmed reachable for this project (tested directly against the API).
+  GEMINI_TEXT_MODEL: z.string().min(1).default("gemini-3.6-flash"),
+  GEMINI_TTS_MODEL: z.string().min(1).default("gemini-3.1-flash-tts-preview"),
+  // NOTE: gemini-3-pro-image-preview and veo-3.1 currently 404 in every region tested —
+  // this project does not yet have Model Garden access granted for these PUBLIC_PREVIEW
+  // models. Needs enabling via the Gemini Enterprise Agent Platform console (Model Garden)
+  // or a Google Cloud support request; not fixable via API/config alone. Left as configured
+  // so they pick up automatically once access is granted.
   GEMINI_IMAGE_MODEL: z.string().min(1).default("gemini-3-pro-image-preview"),
   GEMINI_REALTIME_MODEL: z.string().min(1).default("gemini-2.5-flash-native-audio-preview-12-2025"),
-  GEMINI_TTS_MODEL: z.string().min(1).default("gemini-2.5-flash-preview-tts"),
   VEO_VIDEO_MODEL: z.string().min(1).default("veo-3.1"),
 
   // Set to "true" only in development when custom Firebase tokens are needed.
